@@ -7,7 +7,8 @@ import CampaignTable from './components/CampaignTable'
 import BidSimulator from './components/BidSimulator'
 import {
   fetchOverview, fetchCampaignStats, fetchTimeseries,
-  fetchRecentAuctions, fetchAdSlots, fetchCampaigns, seedDatabase
+  fetchRecentAuctions, fetchAdSlots, fetchCampaigns, seedDatabase,
+  API_URL_MISSING
 } from './api'
 
 function useInterval(fn, ms) {
@@ -17,6 +18,10 @@ function useInterval(fn, ms) {
     return () => clearInterval(id)
   }, [])
 }
+
+// 'connecting' until the first successful load — a cold backend can take up to
+// a minute to answer, and a visitor staring at empty cards assumes it's broken.
+const STATUS = { CONNECTING: 'connecting', LIVE: 'live', ERROR: 'error' }
 
 export default function App() {
   const [overview, setOverview]       = useState(null)
@@ -28,6 +33,8 @@ export default function App() {
   const [seeding, setSeeding]         = useState(false)
   const [seedMsg, setSeedMsg]         = useState(null)
   const [lastRefresh, setLastRefresh] = useState(null)
+  const [status, setStatus]           = useState(STATUS.CONNECTING)
+  const [errorDetail, setErrorDetail] = useState(null)
 
   const refresh = useCallback(async () => {
     try {
@@ -46,8 +53,18 @@ export default function App() {
       setSlots(sl)
       setAllCamps(ac)
       setLastRefresh(new Date())
+      setStatus(STATUS.LIVE)
+      setErrorDetail(null)
     } catch (e) {
       console.error('Refresh failed:', e)
+      setStatus(STATUS.ERROR)
+      setErrorDetail(
+        API_URL_MISSING
+          ? 'VITE_API_URL is not set on this deployment, so the dashboard is calling itself instead of the API.'
+          : e.code === 'ECONNABORTED'
+            ? 'The API did not respond in time. It may be a cold start — retrying automatically.'
+            : `Could not reach the API${e.response ? ` (HTTP ${e.response.status})` : ''}. Retrying automatically.`
+      )
     }
   }, [])
 
@@ -62,7 +79,13 @@ export default function App() {
       setSeedMsg(`✅ Seeded: ${res.advertisers} advertisers, ${res.campaigns} campaigns, ${res.auctions_simulated} auctions`)
       await refresh()
     } catch (e) {
-      setSeedMsg('❌ Seed failed — is the backend running?')
+      // A timeout doesn't mean the seed failed — it's usually still running
+      // server-side, so don't tell the visitor something untrue.
+      setSeedMsg(
+        e.code === 'ECONNABORTED'
+          ? '⏳ Seeding is taking a while — it is still running. The dashboard will fill in on the next refresh.'
+          : '❌ Seed failed — the backend could not be reached.'
+      )
     } finally {
       setSeeding(false)
     }
@@ -74,9 +97,8 @@ export default function App() {
     <div style={{ minHeight: '100vh', background: 'var(--bg)' }}>
 
       {/* ── Header ─────────────────────────────────────────────────────── */}
-      <header style={{
+      <header className="site-header" style={{
         background: 'var(--surface)', borderBottom: '1px solid var(--border)',
-        padding: '0 32px', height: 56,
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
         position: 'sticky', top: 0, zIndex: 10,
       }}>
@@ -84,9 +106,15 @@ export default function App() {
           <Activity size={20} color="var(--accent)" />
           <span style={{ fontWeight: 700, fontSize: 16 }}>RTB Auction Engine</span>
           <span style={{
-            fontSize: 10, background: 'rgba(99,102,241,0.15)', color: 'var(--accent2)',
+            fontSize: 10,
+            background: status === STATUS.LIVE ? 'rgba(34,197,94,0.15)'
+              : status === STATUS.ERROR ? 'rgba(239,68,68,0.15)' : 'rgba(245,158,11,0.15)',
+            color: status === STATUS.LIVE ? 'var(--green)'
+              : status === STATUS.ERROR ? 'var(--red)' : 'var(--amber)',
             padding: '2px 8px', borderRadius: 20, fontWeight: 600, letterSpacing: '0.08em',
-          }}>LIVE</span>
+          }}>
+            {status === STATUS.LIVE ? 'LIVE' : status === STATUS.ERROR ? 'OFFLINE' : 'CONNECTING'}
+          </span>
         </div>
         <div style={{ ...nav, gap: 12 }}>
           {lastRefresh && (
@@ -112,20 +140,42 @@ export default function App() {
         </div>
       </header>
 
+      {/* ── Connection state ───────────────────────────────────────────── */}
+      {status !== STATUS.LIVE && (
+        <div className="banner" style={{
+          background: status === STATUS.ERROR ? 'rgba(239,68,68,0.1)' : 'rgba(245,158,11,0.1)',
+          border: `1px solid ${status === STATUS.ERROR ? 'var(--red)' : 'var(--amber)'}`,
+          color: status === STATUS.ERROR ? 'var(--red)' : 'var(--amber)',
+        }}>
+          {status === STATUS.CONNECTING
+            ? 'Waking up the backend — the first request after an idle period can take up to a minute…'
+            : errorDetail}
+        </div>
+      )}
+
+      {/* ── Empty state ────────────────────────────────────────────────── */}
+      {status === STATUS.LIVE && overview?.total_auctions === 0 && (
+        <div className="banner" style={{
+          background: 'rgba(99,102,241,0.1)', border: '1px solid var(--accent)',
+          color: 'var(--accent2)',
+        }}>
+          No data yet — hit <strong>Seed Demo Data</strong> to create advertisers,
+          campaigns and ad slots, then run auctions of your own.
+        </div>
+      )}
+
       {/* ── Seed message ───────────────────────────────────────────────── */}
       {seedMsg && (
-        <div style={{
-          margin: '16px 32px 0', padding: '10px 16px',
+        <div className="banner" style={{
           background: seedMsg.startsWith('✅') ? 'rgba(34,197,94,0.1)' : 'rgba(239,68,68,0.1)',
           border: `1px solid ${seedMsg.startsWith('✅') ? 'var(--green)' : 'var(--red)'}`,
-          borderRadius: 8, fontSize: 13,
           color: seedMsg.startsWith('✅') ? 'var(--green)' : 'var(--red)',
         }}>
           {seedMsg}
         </div>
       )}
 
-      <main style={{ padding: '24px 32px', maxWidth: 1400, margin: '0 auto' }}>
+      <main className="page" style={{ maxWidth: 1400, margin: '0 auto' }}>
 
         {/* ── KPI Cards ──────────────────────────────────────────────────── */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16, marginBottom: 24 }}>
@@ -170,7 +220,7 @@ export default function App() {
         </div>
 
         {/* ── Chart + Simulator ──────────────────────────────────────────── */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: 16, marginBottom: 16 }}>
+        <div className="split" style={{ display: 'grid', gap: 16, marginBottom: 16 }}>
           <AuctionChart data={timeseries} />
           <BidSimulator slots={slots} onAuctionComplete={refresh} />
         </div>

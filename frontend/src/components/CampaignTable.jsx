@@ -29,7 +29,7 @@ export default function CampaignTable({ campaigns, allCampaigns }) {
         Campaign Performance
       </div>
       <div style={{ overflowX: 'auto' }}>
-        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+        <table style={{ width: '100%', minWidth: 640, borderCollapse: 'collapse' }}>
           <thead>
             <tr style={{ background: 'var(--surface2)' }}>
               {['Campaign', 'Status', 'Impressions', 'Clicks', 'CTR', 'Spend', 'Daily Budget'].map(h => (

@@ -28,7 +28,7 @@ export default function AuctionFeed({ auctions }) {
       </div>
 
       <div style={{ overflowX: 'auto' }}>
-        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+        <table style={{ width: '100%', minWidth: 560, borderCollapse: 'collapse' }}>
           <thead>
             <tr style={{ background: 'var(--surface2)' }}>
               {['Status', 'Auction ID', 'Bidders', 'Top Bid', 'Clearing Price', 'Time'].map(h => (
