@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, Integer, cast
+from sqlalchemy import select, func, and_, Integer, cast, desc
 from app.core.database import get_db
 from app.models.models import AuctionResult, Impression, Click, Campaign
 from app.schemas.schemas import AuctionStats, CampaignStats
@@ -52,25 +52,29 @@ async def get_campaign_stats(db: AsyncSession = Depends(get_db)):
     campaigns_result = await db.execute(select(Campaign))
     campaigns = campaigns_result.scalars().all()
 
+    # Aggregate once per table rather than three queries per campaign — the
+    # dashboard polls this every 5 seconds, so the N+1 version scaled with
+    # campaign count and swamped the connection pooler.
+    imp_rows = await db.execute(
+        select(
+            Impression.campaign_id,
+            func.count(Impression.id),
+            func.avg(Impression.clearing_price_cents),
+        ).group_by(Impression.campaign_id)
+    )
+    imp_by_campaign = {
+        cid: (count, avg or 0) for cid, count, avg in imp_rows.all()
+    }
+
+    click_rows = await db.execute(
+        select(Click.campaign_id, func.count(Click.id)).group_by(Click.campaign_id)
+    )
+    clicks_by_campaign = dict(click_rows.all())
+
     stats = []
     for campaign in campaigns:
-        imp_result = await db.execute(
-            select(func.count(Impression.id))
-            .where(Impression.campaign_id == campaign.id)
-        )
-        impressions = imp_result.scalar() or 0
-
-        click_result = await db.execute(
-            select(func.count(Click.id))
-            .where(Click.campaign_id == campaign.id)
-        )
-        clicks = click_result.scalar() or 0
-
-        avg_cpm = await db.execute(
-            select(func.avg(Impression.clearing_price_cents))
-            .where(Impression.campaign_id == campaign.id)
-        )
-        avg_cpm_val = avg_cpm.scalar() or 0
+        impressions, avg_cpm_val = imp_by_campaign.get(campaign.id, (0, 0))
+        clicks = clicks_by_campaign.get(campaign.id, 0)
 
         stats.append(CampaignStats(
             campaign_id=campaign.id,
@@ -87,19 +91,27 @@ async def get_campaign_stats(db: AsyncSession = Depends(get_db)):
 
 @router.get("/timeseries")
 async def get_timeseries(db: AsyncSession = Depends(get_db)):
-    """Auctions per minute for the live chart."""
+    """
+    Auctions per minute for the live chart.
+
+    Takes the 60 most recent minutes (order desc, then limit) and flips them
+    back to chronological order for plotting. Ordering ascending before the
+    limit returned the *oldest* 60 minutes, which froze the "live" chart on
+    the first hour of data forever.
+    """
+    minute = func.date_trunc("minute", AuctionResult.created_at).label("minute")
     result = await db.execute(
         select(
-            func.date_trunc("minute", AuctionResult.created_at).label("minute"),
+            minute,
             func.count(AuctionResult.id).label("auctions"),
             func.sum(cast(AuctionResult.had_fill, Integer)).label("fills"),
             func.avg(AuctionResult.clearing_price_cents).label("avg_price"),
         )
-        .group_by("minute")
-        .order_by("minute")
+        .group_by(minute)
+        .order_by(desc(minute))
         .limit(60)
     )
-    rows = result.all()
+    rows = list(reversed(result.all()))
     return [
         {
             "minute": row.minute.isoformat() if row.minute else None,

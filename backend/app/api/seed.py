@@ -4,16 +4,18 @@ Generates advertisers, campaigns, publishers, ad slots, and runs 200 simulated a
 """
 
 from fastapi import APIRouter, Depends
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from faker import Faker
 from datetime import datetime, timedelta
 import random
 import json
 
-from app.core.database import get_db
+from app.core.database import get_db, ensure_schema
 from app.models.models import (
     Advertiser, Campaign, CampaignStatus, AuctionType,
-    Publisher, AdSlot, AdCreative, DeviceType
+    Publisher, AdSlot, AdCreative, DeviceType,
+    BidRecord, AuctionResult, Impression, Click
 )
 from app.schemas.schemas import BidRequest
 from app.services.auction_engine import AuctionEngine
@@ -25,10 +27,32 @@ CATEGORIES = ["tech", "finance", "sports", "entertainment", "news", "fashion"]
 COUNTRIES = ["US", "GB", "NG", "DE", "CA", "AU", "FR", "BR"]
 DEVICES = [DeviceType.DESKTOP, DeviceType.MOBILE, DeviceType.TABLET]
 
+# Number of auctions simulated per seed. Kept modest deliberately: this is a
+# public demo, each auction is several database round trips, and the whole
+# request has to finish inside a serverless function's timeout.
+SEED_AUCTIONS = 60
+
+# Child tables first — foreign keys forbid deleting parents while rows point at them.
+WIPE_ORDER = [Click, Impression, BidRecord, AuctionResult, AdCreative, Campaign, AdSlot, Publisher, Advertiser]
+
 
 @router.post("/")
 async def seed_database(db: AsyncSession = Depends(get_db)):
-    """Wipe and reseed with realistic demo data."""
+    """
+    Wipe and reseed with realistic demo data.
+
+    This endpoint is public and visitors will click it repeatedly, so it must
+    be idempotent — it clears existing rows first rather than piling a fresh
+    dataset on top of the old one every time.
+    """
+    # Vercel's ASGI adapter may skip lifespan startup, so the tables might not
+    # exist yet on a cold deploy. Cheap to call when they already do.
+    await ensure_schema()
+
+    # ── Wipe existing demo data ──────────────────────────────────────────────
+    for model in WIPE_ORDER:
+        await db.execute(delete(model))
+    await db.flush()
 
     # ── Advertisers ──────────────────────────────────────────────────────────
     advertiser_names = [
@@ -121,7 +145,7 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
     # ── Simulate auctions ────────────────────────────────────────────────────
     engine = AuctionEngine(db)
     auction_count = 0
-    for _ in range(200):
+    for _ in range(SEED_AUCTIONS):
         slot = random.choice(slots)
         country = random.choice(COUNTRIES)
         device = random.choice(DEVICES)

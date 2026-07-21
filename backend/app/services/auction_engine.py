@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, update
 from sqlalchemy.orm import selectinload
 
 from app.models.models import (
@@ -124,6 +124,25 @@ class AuctionEngine:
         - Has remaining daily budget
         - Bid floor is above the slot's floor price
         """
+        campaigns = await self._query_solvent_campaigns(ad_slot)
+
+        # Public demo: budgets are spent down by visitors and nothing resets
+        # them on a daily cron, so once every campaign is EXHAUSTED the demo
+        # would return "no fill" forever. If nobody can bid, roll the day over
+        # and try once more.
+        if not campaigns and await self._reset_exhausted_budgets():
+            campaigns = await self._query_solvent_campaigns(ad_slot)
+
+        # Apply targeting filters
+        eligible = []
+        for c in campaigns:
+            if self._passes_targeting(c, bid_request):
+                eligible.append(c)
+
+        return eligible
+
+    async def _query_solvent_campaigns(self, ad_slot: AdSlot) -> list[Campaign]:
+        """Active campaigns with budget left that can clear the slot's floor."""
         result = await self.db.execute(
             select(Campaign)
             .where(
@@ -135,15 +154,20 @@ class AuctionEngine:
             )
             .options(selectinload(Campaign.creatives))
         )
-        campaigns = result.scalars().all()
+        return list(result.scalars().all())
 
-        # Apply targeting filters
-        eligible = []
-        for c in campaigns:
-            if self._passes_targeting(c, bid_request):
-                eligible.append(c)
-
-        return eligible
+    async def _reset_exhausted_budgets(self) -> bool:
+        """
+        Simulate the daily budget rollover a real DSP runs on a cron.
+        Returns True if any campaign was actually revived.
+        """
+        result = await self.db.execute(
+            update(Campaign)
+            .where(Campaign.status == CampaignStatus.EXHAUSTED)
+            .values(status=CampaignStatus.ACTIVE, spent_today_cents=0)
+        )
+        await self.db.flush()
+        return result.rowcount > 0
 
     def _passes_targeting(self, campaign: Campaign, bid_request: BidRequest) -> bool:
         """
