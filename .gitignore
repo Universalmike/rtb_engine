@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.venv-*/
+
+# Environment
+.env
+.env.local
+
+# Node
+node_modules/
+dist/
+
+# Vercel
+.vercel/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

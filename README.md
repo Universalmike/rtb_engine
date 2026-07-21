@@ -126,6 +126,48 @@ Campaign   (1) → (N) BidRecord
 Campaign   (1) → (N) Impression (1) → (N) Click
 ```
 
-## Deployment (Railway)
+## Deployment (Vercel)
 
-See `DEPLOYMENT.md` for Railway deployment instructions.
+The demo runs as two Vercel projects from this one repository.
+
+### Backend — `rtb-engine-api`
+
+| Setting | Value |
+|---------|-------|
+| Root Directory | `backend` |
+| Config | `backend/vercel.json` (rewrites all paths to the FastAPI app in `api/index.py`) |
+
+Environment variables:
+
+| Variable | Notes |
+|----------|-------|
+| `DATABASE_URL` | Postgres connection string (Supabase/Neon). Use the **pooled** connection — serverless opens a lot of short-lived connections. |
+| `REDIS_URL` | Upstash Redis. Use the `rediss://` (TLS) URL. Optional — the auction degrades gracefully without it. |
+| `ENVIRONMENT` | `production` |
+
+Verify with `curl https://<backend>/health` — it reports database connectivity,
+so a bad `DATABASE_URL` shows up immediately instead of as an empty dashboard.
+
+### Frontend — `rtb-dashboard`
+
+| Setting | Value |
+|---------|-------|
+| Root Directory | `frontend` |
+| Build Command | `npm run build` (auto-detected) |
+
+Environment variables:
+
+| Variable | Notes |
+|----------|-------|
+| `VITE_API_URL` | **Required.** `https://<backend>/api/v1` — including the `/api/v1` suffix. Vite inlines this at build time, so redeploy after changing it. |
+
+### Demo behaviour
+
+- **Seed** wipes and rebuilds the dataset, so repeated clicks by visitors can't
+  pile up duplicates.
+- **Budgets roll over automatically.** When every campaign has spent its daily
+  budget the next auction resets them, so the demo never gets stuck returning
+  "no fill" — this stands in for the daily cron a real DSP would run.
+
+Docker Compose remains the local development path; `render.yaml` is kept for
+reference if you'd rather run the backend on a long-lived host than serverless.
