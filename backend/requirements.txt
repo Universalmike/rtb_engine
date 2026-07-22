@@ -1,6 +1,11 @@
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 sqlalchemy==2.0.30
+# Transitive (SQLAlchemy's asyncio extra) but pinned deliberately: 3.5.4 was
+# published with no sdist and no Linux wheels, so any fresh resolve picks it up
+# and the build dies with "no source distribution or wheel for the current
+# platform". Pinned to the last good release.
+greenlet==3.5.3
 alembic==1.13.1
 asyncpg==0.29.0
 psycopg2-binary==2.9.9
