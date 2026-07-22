@@ -127,6 +127,30 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
             )
             db.add(campaign)
             campaigns.append(campaign)
+
+    # Run-of-network campaigns: no country or device targeting, so they bid on
+    # every request. Without these, targeting is assigned randomly and whole
+    # country/device combinations can end up with no demand at all — a visitor
+    # picking one gets "no fill" and assumes the engine is broken. Real DSPs
+    # carry RON campaigns for the same reason. Their CPM sits at the low end so
+    # they backstop the auction without winning the interesting ones.
+    for adv in random.sample(advertisers, k=2):
+        ron = Campaign(
+            advertiser_id=adv.id,
+            name=f"{adv.name} — Run of Network",
+            status=CampaignStatus.ACTIVE,
+            daily_budget_cents=200000,       # deliberately large: an exhausted
+            total_budget_cents=200000 * 30,  # RON campaign reopens the gap
+            max_cpm_cents=random.randint(26, 40),
+            auction_type=AuctionType.SECOND_PRICE,
+            target_countries=json.dumps([]),
+            target_devices=json.dumps([]),
+            target_categories=json.dumps([]),
+            start_date=datetime.utcnow() - timedelta(days=7),
+            end_date=datetime.utcnow() + timedelta(days=30),
+        )
+        db.add(ron)
+        campaigns.append(ron)
     await db.flush()
 
     # ── Creatives ────────────────────────────────────────────────────────────

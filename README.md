@@ -136,12 +136,19 @@ The demo runs as two Vercel projects from this one repository.
 |---------|-------|
 | Root Directory | `backend` |
 | Config | `backend/vercel.json` (rewrites all paths to the FastAPI app in `api/index.py`) |
+| Region | `pdx1` — **must match the database's region** (see below) |
+
+`vercel.json` pins `regions: ["pdx1"]` (Oregon) because the Supabase project lives
+in `us-west-2`. This is not cosmetic. Serverless opens a fresh connection per
+invocation, so a single auction pays ~13 network round trips; on Vercel's default
+`iad1` (Virginia) each one crossed the country and the auction took ~2.9s instead
+of well under 100ms. **If you move the database, change this value to match.**
 
 Environment variables:
 
 | Variable | Notes |
 |----------|-------|
-| `DATABASE_URL` | Postgres connection string (Supabase/Neon). Use the **pooled** connection — serverless opens a lot of short-lived connections. |
+| `DATABASE_URL` | Postgres connection string (Supabase/Neon). Use the **pooled** connection on port **6543** (transaction mode) — port 5432 on a pooler host is session mode, which pins a backend connection per client and is the wrong fit for serverless. |
 | `REDIS_URL` | Upstash Redis. Use the `rediss://` (TLS) URL. Optional — the auction degrades gracefully without it. |
 | `ENVIRONMENT` | `production` |
 
