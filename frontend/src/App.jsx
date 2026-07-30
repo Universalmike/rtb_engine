@@ -4,9 +4,10 @@ import StatCard from './components/StatCard'
 import AuctionChart from './components/AuctionChart'
 import AuctionFeed from './components/AuctionFeed'
 import CampaignTable from './components/CampaignTable'
+import AbComparison from './components/AbComparison'
 import BidSimulator from './components/BidSimulator'
 import {
-  fetchOverview, fetchCampaignStats, fetchTimeseries,
+  fetchOverview, fetchCampaignStats, fetchTimeseries, fetchAbComparison,
   fetchRecentAuctions, fetchAdSlots, fetchCampaigns, seedDatabase,
   API_URL_MISSING
 } from './api'
@@ -29,6 +30,7 @@ export default function App() {
   const [allCampaigns, setAllCamps]   = useState([])
   const [timeseries, setTimeseries]   = useState([])
   const [recentAuctions, setRecent]   = useState([])
+  const [abData, setAbData]           = useState([])
   const [slots, setSlots]             = useState([])
   const [seeding, setSeeding]         = useState(false)
   const [seedMsg, setSeedMsg]         = useState(null)
@@ -38,18 +40,20 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [ov, cs, ts, ra, sl, ac] = await Promise.all([
+      const [ov, cs, ts, ra, sl, ac, ab] = await Promise.all([
         fetchOverview(),
         fetchCampaignStats(),
         fetchTimeseries(),
         fetchRecentAuctions(20),
         fetchAdSlots(),
         fetchCampaigns(),
+        fetchAbComparison(),
       ])
       setOverview(ov)
       setCStats(cs)
       setTimeseries(ts)
       setRecent(ra)
+      setAbData(ab)
       setSlots(sl)
       setAllCamps(ac)
       setLastRefresh(new Date())
@@ -228,6 +232,11 @@ export default function App() {
         {/* ── Auction Feed ───────────────────────────────────────────────── */}
         <div style={{ marginBottom: 16 }}>
           <AuctionFeed auctions={recentAuctions} />
+        </div>
+
+        {/* ── A/B Bidding Comparison ─────────────────────────────────────── */}
+        <div style={{ marginBottom: 16 }}>
+          <AbComparison data={abData} />
         </div>
 
         {/* ── Campaign Table ─────────────────────────────────────────────── */}
