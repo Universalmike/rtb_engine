@@ -17,6 +17,7 @@ mechanism used by Google Ad Exchange, AppNexus, and most major DSPs.
 import uuid
 import time
 import json
+import random
 from datetime import datetime
 from typing import Optional
 
@@ -31,6 +32,7 @@ from app.models.models import (
 from app.schemas.schemas import BidRequest, BidResponse, AuctionType
 from app.core.redis_client import get_redis, IMPRESSION_STREAM, BID_STREAM
 from app.core.config import get_settings
+from app.ml.predictor import predict_ctr
 
 settings = get_settings()
 
@@ -51,21 +53,32 @@ class AuctionEngine:
         # 1. Fetch the ad slot
         ad_slot = await self._get_ad_slot(bid_request.ad_slot_id)
         if not ad_slot:
-            return self._no_fill_response(auction_id, bid_request, start_time)
+            return self._no_fill_response(auction_id, bid_request, start_time, "control")
 
         # 2. Get eligible campaigns
         eligible_campaigns = await self._get_eligible_campaigns(bid_request, ad_slot)
 
         if not eligible_campaigns:
-            await self._save_no_fill_result(auction_id, ad_slot, start_time)
-            return self._no_fill_response(auction_id, bid_request, start_time)
+            await self._save_no_fill_result(auction_id, ad_slot, start_time, "control")
+            return self._no_fill_response(auction_id, bid_request, start_time, "control")
 
-        # 3. Collect bids — each campaign bids its max CPM
-        bids = self._collect_bids(eligible_campaigns, ad_slot)
+        # A/B: assign this auction to a bidding strategy and predict CTR once
+        # (pCTR is a property of the impression context, identical across
+        # campaigns in the same auction).
+        strategy = random.choice(["control", "treatment"])
+        pctr = predict_ctr(
+            device_type=bid_request.device_type.value,
+            publisher_category=ad_slot.publisher.category,
+            banner_pos=ad_slot.banner_pos,
+            hour=datetime.utcnow().hour,
+        )
+
+        # 3. Collect bids under the assigned strategy
+        bids = self._collect_bids(eligible_campaigns, ad_slot, strategy, pctr)
 
         if not bids:
-            await self._save_no_fill_result(auction_id, ad_slot, start_time)
-            return self._no_fill_response(auction_id, bid_request, start_time)
+            await self._save_no_fill_result(auction_id, ad_slot, start_time, strategy)
+            return self._no_fill_response(auction_id, bid_request, start_time, strategy)
 
         # 4. Run the auction
         result = self._run_second_price_auction(bids, ad_slot)
@@ -81,7 +94,7 @@ class AuctionEngine:
         # 7. Save auction result
         await self._save_auction_result(
             auction_id, ad_slot, winning_campaign, creative,
-            result["highest_bid_cents"], clearing_price, len(bids)
+            result["highest_bid_cents"], clearing_price, len(bids), strategy
         )
 
         # 8. Deduct budget from winning campaign
@@ -105,13 +118,16 @@ class AuctionEngine:
             num_bidders=len(bids),
             auction_type=AuctionType.SECOND_PRICE,
             latency_ms=round(latency, 2),
+            strategy=strategy,
         )
 
     # ─── Private helpers ──────────────────────────────────────────────────────
 
     async def _get_ad_slot(self, slot_id: str) -> Optional[AdSlot]:
         result = await self.db.execute(
-            select(AdSlot).where(AdSlot.id == slot_id, AdSlot.is_active == True)
+            select(AdSlot)
+            .where(AdSlot.id == slot_id, AdSlot.is_active == True)
+            .options(selectinload(AdSlot.publisher))
         )
         return result.scalar_one_or_none()
 
@@ -190,27 +206,35 @@ class AuctionEngine:
         return True
 
     def _collect_bids(
-        self, campaigns: list[Campaign], ad_slot: AdSlot
+        self, campaigns: list[Campaign], ad_slot: AdSlot,
+        strategy: str, pctr: float,
     ) -> list[dict]:
-        """
-        Each campaign bids its max_cpm_cents, capped by remaining budget.
-        In a real DSP, bid shading algorithms would reduce bids below max
-        to optimise ROI — we keep it simple here.
+        """Each campaign submits a bid.
+
+        control:   flat max CPM (the original behaviour).
+        treatment: expected value = pCTR * value_per_click, capped by the
+                   advertiser's max CPM. This is how real DSPs derive a CPM bid.
+                   value_per_click is in millicents, so pCTR * millicents already
+                   yields a CPM in cents (the /1000 for millicents and the *1000
+                   for per-impression -> per-mille cancel).
+        Both are capped by remaining budget and must clear the slot floor.
         """
         bids = []
         for campaign in campaigns:
-            # Can't bid more than remaining budget
-            bid_amount = min(
-                campaign.max_cpm_cents,
-                campaign.remaining_daily_budget_cents
-            )
+            if strategy == "treatment":
+                ev_cpm = round(pctr * campaign.value_per_click_millicents)
+                bid_amount = min(
+                    ev_cpm, campaign.max_cpm_cents,
+                    campaign.remaining_daily_budget_cents,
+                )
+            else:
+                bid_amount = min(
+                    campaign.max_cpm_cents,
+                    campaign.remaining_daily_budget_cents,
+                )
             if bid_amount >= ad_slot.floor_price_cents:
-                bids.append({
-                    "campaign": campaign,
-                    "bid_cents": bid_amount,
-                })
+                bids.append({"campaign": campaign, "bid_cents": bid_amount})
 
-        # Sort descending by bid amount
         return sorted(bids, key=lambda x: x["bid_cents"], reverse=True)
 
     def _run_second_price_auction(
@@ -263,7 +287,7 @@ class AuctionEngine:
 
     async def _save_auction_result(
         self, auction_id, ad_slot, winning_campaign,
-        creative, highest_bid, clearing_price, num_bidders
+        creative, highest_bid, clearing_price, num_bidders, strategy
     ):
         result = AuctionResult(
             auction_id=auction_id,
@@ -274,6 +298,7 @@ class AuctionEngine:
             clearing_price_cents=clearing_price,
             num_bidders=num_bidders,
             had_fill=True,
+            strategy=strategy,
         )
         self.db.add(result)
         await self.db.flush()
@@ -323,7 +348,7 @@ class AuctionEngine:
             # Never let Redis failures block the auction response
             print(f"Warning: Redis emit failed: {e}")
 
-    async def _save_no_fill_result(self, auction_id, ad_slot, start_time):
+    async def _save_no_fill_result(self, auction_id, ad_slot, start_time, strategy):
         result = AuctionResult(
             auction_id=auction_id,
             ad_slot_id=ad_slot.id,
@@ -331,11 +356,12 @@ class AuctionEngine:
             clearing_price_cents=0,
             num_bidders=0,
             had_fill=False,
+            strategy=strategy,
         )
         self.db.add(result)
         await self.db.flush()
 
-    def _no_fill_response(self, auction_id, bid_request, start_time) -> BidResponse:
+    def _no_fill_response(self, auction_id, bid_request, start_time, strategy) -> BidResponse:
         latency = (time.monotonic() - start_time) * 1000
         return BidResponse(
             auction_id=auction_id,
@@ -348,4 +374,5 @@ class AuctionEngine:
             num_bidders=0,
             auction_type=AuctionType.SECOND_PRICE,
             latency_ms=round(latency, 2),
+            strategy=strategy,
         )

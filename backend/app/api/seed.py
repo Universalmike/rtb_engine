@@ -4,14 +4,14 @@ Generates advertisers, campaigns, publishers, ad slots, and runs 200 simulated a
 """
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import delete
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from faker import Faker
 from datetime import datetime, timedelta
 import random
 import json
 
-from app.core.database import get_db, ensure_schema
+from app.core.database import get_db, reset_schema
 from app.models.models import (
     Advertiser, Campaign, CampaignStatus, AuctionType,
     Publisher, AdSlot, AdCreative, DeviceType,
@@ -19,6 +19,9 @@ from app.models.models import (
 )
 from app.schemas.schemas import BidRequest
 from app.services.auction_engine import AuctionEngine
+from app.ml.artifacts import load_empirical_ctr
+from app.ml.mappings import SLOT_NAME_TO_BANNER_POS
+from app.ml.simulation import lookup_ctr
 
 router = APIRouter()
 fake = Faker()
@@ -27,13 +30,22 @@ CATEGORIES = ["tech", "finance", "sports", "entertainment", "news", "fashion"]
 COUNTRIES = ["US", "GB", "NG", "DE", "CA", "AU", "FR", "BR"]
 DEVICES = [DeviceType.DESKTOP, DeviceType.MOBILE, DeviceType.TABLET]
 
-# Number of auctions simulated per seed. Kept modest deliberately: this is a
-# public demo, each auction is several database round trips, and the whole
-# request has to finish inside a serverless function's timeout.
-SEED_AUCTIONS = 60
+# Number of auctions simulated per seed. Raised from 60 so the A/B comparison
+# accumulates enough clicks to be statistically legible on the dashboard. On a
+# long-running host (Render) this finishes comfortably; on a serverless function
+# with a short timeout, drop it back down.
+SEED_AUCTIONS = 400
 
-# Child tables first — foreign keys forbid deleting parents while rows point at them.
-WIPE_ORDER = [Click, Impression, BidRecord, AuctionResult, AdCreative, Campaign, AdSlot, Publisher, Advertiser]
+def _value_per_click_millicents(max_cpm_cents: int, baseline_ctr: float) -> int:
+    """Click value (in millicents) that makes EV(baseline) == max_cpm, jittered.
+
+    Keeps mean treatment spend ≈ control spend so the A/B measures better
+    allocation of budget, not a systematic bid multiplier. Millicents (not cents)
+    because Avazu's ~16% CTR makes the fair value sub-one-cent — integer cents
+    would round every campaign to the same 1 and defeat the normalization.
+    """
+    base = max_cpm_cents / baseline_ctr  # = max_cpm/(baseline*1000) * 1000
+    return max(1, round(base * random.uniform(0.7, 1.3)))
 
 
 @router.post("/")
@@ -45,14 +57,13 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
     be idempotent — it clears existing rows first rather than piling a fresh
     dataset on top of the old one every time.
     """
-    # Vercel's ASGI adapter may skip lifespan startup, so the tables might not
-    # exist yet on a cold deploy. Cheap to call when they already do.
-    await ensure_schema()
+    # Drop and recreate every table so schema changes (new columns) take effect.
+    # The demo data is disposable, so this replaces the old row-by-row wipe.
+    await reset_schema()
 
-    # ── Wipe existing demo data ──────────────────────────────────────────────
-    for model in WIPE_ORDER:
-        await db.execute(delete(model))
-    await db.flush()
+    # Held-out empirical CTRs drive realistic click simulation below.
+    empirical = load_empirical_ctr()
+    baseline_ctr = empirical.get("__baseline__", 0.163)
 
     # ── Advertisers ──────────────────────────────────────────────────────────
     advertiser_names = [
@@ -93,6 +104,7 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
         ("Half Page 300x600", 300, 600, DeviceType.DESKTOP, 25),
         ("Mobile Interstitial 320x480", 320, 480, DeviceType.MOBILE, 18),
     ]
+    slot_context = {}  # slot.id -> (publisher_category, banner_pos)
     for pub in publishers:
         for slot_name, w, h, device, floor in slot_configs:
             slot = AdSlot(
@@ -101,23 +113,32 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
                 width=w, height=h,
                 floor_price_cents=floor,
                 device_type=device,
+                banner_pos=SLOT_NAME_TO_BANNER_POS.get(slot_name, 0),
             )
             db.add(slot)
             slots.append(slot)
     await db.flush()
+    for pub in publishers:
+        for slot in slots:
+            if slot.publisher_id == pub.id:
+                slot_context[slot.id] = (pub.category,
+                                         SLOT_NAME_TO_BANNER_POS.get(slot.name, 0))
 
     # ── Campaigns ────────────────────────────────────────────────────────────
     campaigns = []
     for adv in advertisers:
         for i in range(random.randint(1, 3)):
             daily_budget = random.randint(5000, 50000)   # $50–$500/day
+            campaign_max_cpm = random.randint(20, 150)   # $0.20–$1.50 CPM
             campaign = Campaign(
                 advertiser_id=adv.id,
                 name=f"{adv.name} — Campaign {i+1}",
                 status=CampaignStatus.ACTIVE,
                 daily_budget_cents=daily_budget,
                 total_budget_cents=daily_budget * 30,
-                max_cpm_cents=random.randint(20, 150),   # $0.20–$1.50 CPM
+                max_cpm_cents=campaign_max_cpm,
+                value_per_click_millicents=_value_per_click_millicents(
+                    campaign_max_cpm, baseline_ctr),
                 auction_type=AuctionType.SECOND_PRICE,
                 target_countries=json.dumps(random.sample(COUNTRIES, k=random.randint(1, 4))),
                 target_devices=json.dumps([d.value for d in random.sample(DEVICES, k=random.randint(1, 2))]),
@@ -135,13 +156,16 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
     # carry RON campaigns for the same reason. Their CPM sits at the low end so
     # they backstop the auction without winning the interesting ones.
     for adv in random.sample(advertisers, k=2):
+        ron_max_cpm = random.randint(26, 40)
         ron = Campaign(
             advertiser_id=adv.id,
             name=f"{adv.name} — Run of Network",
             status=CampaignStatus.ACTIVE,
             daily_budget_cents=200000,       # deliberately large: an exhausted
             total_budget_cents=200000 * 30,  # RON campaign reopens the gap
-            max_cpm_cents=random.randint(26, 40),
+            max_cpm_cents=ron_max_cpm,
+            value_per_click_millicents=_value_per_click_millicents(
+                ron_max_cpm, baseline_ctr),
             auction_type=AuctionType.SECOND_PRICE,
             target_countries=json.dumps([]),
             target_devices=json.dumps([]),
@@ -169,6 +193,7 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
     # ── Simulate auctions ────────────────────────────────────────────────────
     engine = AuctionEngine(db)
     auction_count = 0
+    click_count = 0
     for _ in range(SEED_AUCTIONS):
         slot = random.choice(slots)
         country = random.choice(COUNTRIES)
@@ -182,10 +207,28 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
             user_agent=fake.user_agent(),
         )
         try:
-            await engine.run_auction(bid_req)
+            resp = await engine.run_auction(bid_req)
             auction_count += 1
         except Exception as e:
             print(f"Auction failed: {e}")
+            continue
+
+        if not resp.had_fill:
+            continue
+
+        # Draw a click from the held-out empirical CTR for this segment. Ground
+        # truth the served model never trained on, so measured A/B lift is real.
+        pub_category, banner_pos = slot_context[slot.id]
+        ctr = lookup_ctr(empirical, device.value, pub_category, banner_pos,
+                         datetime.utcnow().hour)
+        if random.random() < ctr:
+            imp = (await db.execute(
+                select(Impression).where(Impression.auction_id == resp.auction_id)
+            )).scalar_one_or_none()
+            if imp:
+                db.add(Click(impression_id=imp.id, campaign_id=imp.campaign_id))
+                click_count += 1
+    await db.flush()
 
     return {
         "message": "Database seeded successfully",
@@ -194,4 +237,5 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
         "ad_slots": len(slots),
         "campaigns": len(campaigns),
         "auctions_simulated": auction_count,
+        "clicks_simulated": click_count,
     }

@@ -56,6 +56,14 @@ async def ensure_schema() -> None:
         await conn.run_sync(Base.metadata.create_all)
 
 
+async def reset_schema() -> None:
+    """Drop and recreate every table. Used only by the seed endpoint — the demo
+    data is disposable, and this lets schema changes take effect without Alembic."""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+
+
 async def get_db() -> AsyncSession:
     async with AsyncSessionLocal() as session:
         try:
