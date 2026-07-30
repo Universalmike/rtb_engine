@@ -19,6 +19,7 @@ const api = axios.create({
 export const fetchOverview    = () => api.get('/analytics/overview').then(r => r.data)
 export const fetchCampaignStats = () => api.get('/analytics/campaigns').then(r => r.data)
 export const fetchTimeseries  = () => api.get('/analytics/timeseries').then(r => r.data)
+export const fetchAbComparison = () => api.get('/analytics/ab-comparison').then(r => r.data)
 
 // ── Auction ──────────────────────────────────────────────────────────────────
 export const fetchRecentAuctions = (limit = 20) =>

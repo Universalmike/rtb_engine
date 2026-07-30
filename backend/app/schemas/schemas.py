@@ -116,6 +116,7 @@ class BidResponse(BaseModel):
     num_bidders: int
     auction_type: AuctionType
     latency_ms: float                   # How long the auction took
+    strategy: str = "control"           # which A/B arm ran this auction
 
 
 # ─── Analytics ────────────────────────────────────────────────────────────────
