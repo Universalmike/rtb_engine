@@ -88,6 +88,11 @@ class Campaign(Base):
 
     # Bidding
     max_cpm_cents: Mapped[int] = mapped_column(Integer, nullable=False)  # Max bid per 1000 impressions
+    # Value of one click to the advertiser, in millicents (1/1000 cent). Stored
+    # finer than cents because Avazu's ~16% CTR makes the fair per-click value
+    # sub-one-cent — integer cents would collapse every campaign to the same 1.
+    # EV bid (CPM cents) = pCTR * value_per_click_millicents.
+    value_per_click_millicents: Mapped[int] = mapped_column(Integer, default=0)
     auction_type: Mapped[AuctionType] = mapped_column(SAEnum(AuctionType), default=AuctionType.SECOND_PRICE)
 
     # Targeting
@@ -175,6 +180,7 @@ class AdSlot(Base):
     height: Mapped[int] = mapped_column(Integer, nullable=False)
     floor_price_cents: Mapped[int] = mapped_column(Integer, default=10)  # Min acceptable bid in cents CPM
     device_type: Mapped[DeviceType] = mapped_column(SAEnum(DeviceType), default=DeviceType.DESKTOP)
+    banner_pos: Mapped[int] = mapped_column(Integer, default=0)  # Avazu-convention slot position
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
     publisher: Mapped["Publisher"] = relationship("Publisher", back_populates="ad_slots")
@@ -221,6 +227,7 @@ class AuctionResult(Base):
     highest_bid_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     clearing_price_cents: Mapped[int] = mapped_column(Integer, nullable=False)  # What winner pays
     num_bidders: Mapped[int] = mapped_column(Integer, default=0)
+    strategy: Mapped[str] = mapped_column(String(20), default="control")  # control | treatment
     had_fill: Mapped[bool] = mapped_column(Boolean, default=False)  # False = no bids above floor
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
