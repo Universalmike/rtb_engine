@@ -22,6 +22,7 @@ Publisher (SSP)  →  Bid Request  →  RTB Engine  →  Auction Result
 | Database | PostgreSQL + SQLAlchemy | ACID transactions for billing accuracy |
 | Cache/Streams | Redis + Redis Streams | Event pipeline for impressions/clicks |
 | Frontend | React + Recharts | Live dashboard with auto-refresh |
+| ML | scikit-learn (offline) + pure-Python serving | CTR model drives expected-value bidding |
 | Containerisation | Docker Compose | Reproducible local dev environment |
 
 ## Key Features
@@ -30,7 +31,35 @@ Publisher (SSP)  →  Bid Request  →  RTB Engine  →  Auction Result
 - **Budget pacing** — campaigns auto-pause when daily budget is exhausted
 - **Targeting** — country, device type, and IAB category filtering
 - **Redis Streams event pipeline** — impression events fire asynchronously, never blocking the auction response
+- **CTR-driven expected-value bidding** — a click-through-rate model trained on real ad data lets campaigns bid `pCTR × value_per_click` instead of a flat CPM (see below)
+- **Live A/B test** — every auction is randomly assigned to flat-CPM (control) or expected-value bidding (treatment); the dashboard compares their cost per click side by side
 - **Live dashboard** — 5-second auto-refresh with auction volume charts, campaign CTR, fill rate KPIs
+
+## Machine Learning: CTR-Driven Bidding
+
+Real demand-side platforms don't bid a flat price — they bid what an impression is
+worth, which means predicting how likely it is to be clicked.
+
+- **Model.** A click-through-rate (CTR) model trained offline on the real
+  [Avazu](https://www.kaggle.com/competitions/avazu-ctr-prediction) ad dataset,
+  restricted to features the auction engine can actually supply at bid time
+  (device, publisher category, ad position, hour of day). Logistic regression,
+  evaluated with a time-based train/test split and a calibration check.
+- **Serving.** The trained coefficients are exported to plain JSON and scored with a
+  few lines of pure Python (a weighted sum + sigmoid) — no scikit-learn or numpy in
+  the running API, which keeps it light. If the model file is missing or a value is
+  unknown, it falls back to the baseline rate and the auction never breaks.
+- **Bidding.** In the treatment arm, a campaign bids `pCTR × value_per_click`, capped
+  by its max CPM. Low-CTR impressions get lower bids; high-CTR ones get more.
+- **Honest framing.** The model and its training data are real; the traffic it scores
+  in the demo is simulated. That mirrors production, where a model trained on
+  historical logs scores live traffic it has never seen. Simulated clicks are drawn
+  from held-out empirical CTRs the model never trained on, so the A/B result isn't
+  circular.
+
+**Result.** At equal click-through rate, expected-value bidding lowered the effective
+cost per click by roughly 15–20% versus flat bidding — it wins the same impressions
+for less by not overpaying on low-value ones.
 
 ## Running Locally
 
@@ -72,7 +101,8 @@ Click **"Seed Demo Data"** in the dashboard header, or:
 curl -X POST http://localhost:8000/api/v1/seed/
 ```
 
-This creates 8 advertisers, ~20 campaigns, 25 ad slots, and runs 200 simulated auctions.
+This creates 8 advertisers, ~20 campaigns, 25 ad slots, and runs 400 simulated auctions
+(with simulated clicks) so the A/B comparison has data to show.
 
 ### 4. Run a manual auction
 
@@ -100,6 +130,7 @@ curl -X POST http://localhost:8000/api/v1/auction/bid \
 | `GET` | `/api/v1/analytics/overview` | KPI aggregates |
 | `GET` | `/api/v1/analytics/campaigns` | Per-campaign performance |
 | `GET` | `/api/v1/analytics/timeseries` | Auction volume by minute |
+| `GET` | `/api/v1/analytics/ab-comparison` | Flat-CPM vs expected-value bidding, per arm |
 | `POST` | `/api/v1/advertisers/` | Create advertiser |
 | `POST` | `/api/v1/campaigns/` | Create campaign |
 | `POST` | `/api/v1/publishers/slots` | Create ad slot |
@@ -126,36 +157,42 @@ Campaign   (1) → (N) BidRecord
 Campaign   (1) → (N) Impression (1) → (N) Click
 ```
 
-## Deployment (Vercel)
+## Deployment
 
-The demo runs as two Vercel projects from this one repository.
+The backend runs on **Render** (a long-lived container) and the frontend on
+**Vercel**, both from this one repository.
 
-### Backend — `rtb-engine-api`
+### Backend — Render
+
+`render.yaml` provisions a web service in the **Oregon** region so it sits next to
+the Supabase database (`us-west-2`). Colocation matters: an auction makes several
+sequential database round trips, so a cross-country hop turned a sub-100ms auction
+into ~3s. On a long-lived host the connection pool stays warm, so that connection
+cost is paid once at boot instead of on every request.
 
 | Setting | Value |
 |---------|-------|
 | Root Directory | `backend` |
-| Config | `backend/vercel.json` (rewrites all paths to the FastAPI app in `api/index.py`) |
-| Region | `pdx1` — **must match the database's region** (see below) |
-
-`vercel.json` pins `regions: ["pdx1"]` (Oregon) because the Supabase project lives
-in `us-west-2`. This is not cosmetic. Serverless opens a fresh connection per
-invocation, so a single auction pays ~13 network round trips; on Vercel's default
-`iad1` (Virginia) each one crossed the country and the auction took ~2.9s instead
-of well under 100ms. **If you move the database, change this value to match.**
+| Build | `pip install -r requirements.txt` |
+| Start | `uvicorn app.main:app --host 0.0.0.0 --port $PORT` |
+| Region | `oregon` — match your database's region |
 
 Environment variables:
 
 | Variable | Notes |
 |----------|-------|
-| `DATABASE_URL` | Postgres connection string (Supabase/Neon). Use the **pooled** connection on port **6543** (transaction mode) — port 5432 on a pooler host is session mode, which pins a backend connection per client and is the wrong fit for serverless. |
+| `DATABASE_URL` | Postgres connection string (Supabase). Port `5432` is fine on a long-lived host — the pool stays open, so serverless pooler concerns don't apply. |
 | `REDIS_URL` | Upstash Redis. Use the `rediss://` (TLS) URL. Optional — the auction degrades gracefully without it. |
 | `ENVIRONMENT` | `production` |
 
 Verify with `curl https://<backend>/health` — it reports database connectivity,
 so a bad `DATABASE_URL` shows up immediately instead of as an empty dashboard.
 
-### Frontend — `rtb-dashboard`
+> **Free-tier note:** Render spins the service down after ~15 minutes idle, and the
+> next request pays a ~50s cold start. Use a paid instance or a keep-warm ping if
+> you need the demo to answer instantly.
+
+### Frontend — Vercel
 
 | Setting | Value |
 |---------|-------|
@@ -166,7 +203,13 @@ Environment variables:
 
 | Variable | Notes |
 |----------|-------|
-| `VITE_API_URL` | **Required.** `https://<backend>/api/v1` — including the `/api/v1` suffix. Vite inlines this at build time, so redeploy after changing it. |
+| `VITE_API_URL` | **Required.** `https://<render-backend>/api/v1` — including the `/api/v1` suffix. Vite inlines this at build time, so redeploy after changing it. |
+
+After both are up, run `POST /api/v1/seed/` once to populate the dashboard (the A/B
+panel is empty until there's data).
+
+`backend/vercel.json` and `backend/api/index.py` remain for an optional serverless
+deployment but are unused on Render.
 
 ### Demo behaviour
 
@@ -175,6 +218,3 @@ Environment variables:
 - **Budgets roll over automatically.** When every campaign has spent its daily
   budget the next auction resets them, so the demo never gets stuck returning
   "no fill" — this stands in for the daily cron a real DSP would run.
-
-Docker Compose remains the local development path; `render.yaml` is kept for
-reference if you'd rather run the backend on a long-lived host than serverless.
