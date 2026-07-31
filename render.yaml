@@ -21,7 +21,7 @@ services:
       - key: SECRET_KEY
         generateValue: true
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: 3.11.9
 
 # No databases block — using Supabase (PostgreSQL) + Upstash (Redis) instead.
 # Both are free and don't expire like Render's free DB tier.
