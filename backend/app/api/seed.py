@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from faker import Faker
 from datetime import datetime, timedelta
+import os
 import random
 import json
 
@@ -30,11 +31,13 @@ CATEGORIES = ["tech", "finance", "sports", "entertainment", "news", "fashion"]
 COUNTRIES = ["US", "GB", "NG", "DE", "CA", "AU", "FR", "BR"]
 DEVICES = [DeviceType.DESKTOP, DeviceType.MOBILE, DeviceType.TABLET]
 
-# Number of auctions simulated per seed. Raised from 60 so the A/B comparison
-# accumulates enough clicks to be statistically legible on the dashboard. On a
-# long-running host (Render) this finishes comfortably; on a serverless function
-# with a short timeout, drop it back down.
-SEED_AUCTIONS = 400
+# Number of auctions simulated per seed. The whole seed runs in ONE request and
+# ONE transaction, and each auction is ~13 sequential DB round trips. On a
+# deployed backend where the database is a network hop away, a high count runs
+# for minutes and can hit request/transaction timeouts (400 timed out at ~126s
+# on free-tier Render). Default is kept modest so the seed always completes;
+# override with the SEED_AUCTIONS env var for a richer local A/B sample.
+SEED_AUCTIONS = int(os.getenv("SEED_AUCTIONS", "120"))
 
 def _value_per_click_millicents(max_cpm_cents: int, baseline_ctr: float) -> int:
     """Click value (in millicents) that makes EV(baseline) == max_cpm, jittered.
