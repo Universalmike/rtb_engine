@@ -37,21 +37,21 @@ class AnalyticsAggregator:
         self.impressions_by_country  = defaultdict(int)
         self.impressions_by_device   = defaultdict(int)
         self.total_processed         = 0
-        self.total_spend_cents       = 0
+        self.total_spend_micros      = 0
         self.start_time              = datetime.now(timezone.utc)
 
     def record_impression(self, event: dict):
         campaign_id    = event.get("campaign_id", "unknown")
-        clearing_price = int(event.get("clearing_price_cents", 0))
+        charged_cost = int(event.get("charged_cost_micros", 0))
         country        = event.get("country", "unknown")
         device         = event.get("device_type", "unknown")
 
         self.impressions_by_campaign[campaign_id] += 1
-        self.spend_by_campaign[campaign_id]       += clearing_price
+        self.spend_by_campaign[campaign_id]       += charged_cost
         self.impressions_by_country[country]      += 1
         self.impressions_by_device[device]        += 1
         self.total_processed                      += 1
-        self.total_spend_cents                    += clearing_price
+        self.total_spend_micros                   += charged_cost
 
     def report(self) -> str:
         elapsed = (datetime.now(timezone.utc) - self.start_time).total_seconds()
@@ -61,15 +61,18 @@ class AnalyticsAggregator:
             f"{'═'*52}",
             f"  Uptime:            {elapsed:.0f}s",
             f"  Total impressions: {self.total_processed:,}",
-            f"  Total spend:       ${self.total_spend_cents/100:,.4f}",
+            f"  Total spend:       ${self.total_spend_micros/1_000_000:,.4f}",
             f"  Throughput:        {self.total_processed/elapsed:.1f} events/s" if elapsed > 0 else "  Throughput:        —",
             f"",
             f"  Top campaigns by impressions:",
         ]
         top = sorted(self.impressions_by_campaign.items(), key=lambda x: x[1], reverse=True)[:5]
         for campaign_id, count in top:
-            spend = self.spend_by_campaign[campaign_id]
-            lines.append(f"    {campaign_id[:8]}…  {count:>6} imps  ${spend/100:.4f} spend")
+            spend_micros = self.spend_by_campaign[campaign_id]
+            lines.append(
+                f"    {campaign_id[:8]}...  {count:>6} imps  "
+                f"${spend_micros/1_000_000:.4f} spend"
+            )
 
         if self.impressions_by_country:
             lines.append(f"\n  Impressions by country:")

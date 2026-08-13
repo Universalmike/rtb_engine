@@ -181,16 +181,22 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
     await db.flush()
 
     # ── Creatives ────────────────────────────────────────────────────────────
+    creative_sizes = {(w, h) for _, w, h, _, _ in slot_configs}
     for campaign in campaigns:
-        creative = AdCreative(
-            campaign_id=campaign.id,
-            name=f"{campaign.name} — Banner",
-            creative_type="banner",
-            width=728, height=90,
-            click_url=f"https://{fake.domain_name()}/landing",
-            asset_url=f"https://picsum.photos/728/90?random={random.randint(1,999)}",
-        )
-        db.add(creative)
+        for width, height in creative_sizes:
+            creative = AdCreative(
+                campaign_id=campaign.id,
+                name=f"{campaign.name} - {width}x{height} Banner",
+                creative_type="banner",
+                width=width,
+                height=height,
+                click_url=f"https://{fake.domain_name()}/landing",
+                asset_url=(
+                    f"https://picsum.photos/{width}/{height}"
+                    f"?random={random.randint(1,999)}"
+                ),
+            )
+            db.add(creative)
     await db.flush()
 
     # ── Simulate auctions ────────────────────────────────────────────────────

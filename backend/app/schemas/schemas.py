@@ -1,8 +1,7 @@
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, model_validator
 from datetime import datetime
 from typing import Optional
 from app.models.models import CampaignStatus, AuctionType, DeviceType
-import json
 
 
 # ─── Advertiser ───────────────────────────────────────────────────────────────
@@ -28,12 +27,21 @@ class CampaignCreate(BaseModel):
     daily_budget_cents: int = Field(..., gt=0, description="Daily budget in USD cents")
     total_budget_cents: int = Field(..., gt=0)
     max_cpm_cents: int = Field(..., gt=0, description="Max CPM bid in USD cents")
+    value_per_click_millicents: Optional[int] = Field(default=None, gt=0)
     auction_type: AuctionType = AuctionType.SECOND_PRICE
     target_countries: list[str] = []
     target_devices: list[str] = []
     target_categories: list[str] = []
     start_date: datetime
     end_date: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def validate_budget_and_dates(self):
+        if self.total_budget_cents < self.daily_budget_cents:
+            raise ValueError("total_budget_cents must be at least daily_budget_cents")
+        if self.end_date is not None and self.end_date <= self.start_date:
+            raise ValueError("end_date must be after start_date")
+        return self
 
 class CampaignOut(BaseModel):
     id: str
@@ -42,11 +50,12 @@ class CampaignOut(BaseModel):
     status: CampaignStatus
     daily_budget_cents: int
     total_budget_cents: int
-    spent_today_cents: int
-    total_spent_cents: int
+    spent_today_cents: float
+    total_spent_cents: float
     max_cpm_cents: int
+    value_per_click_millicents: int
     auction_type: AuctionType
-    remaining_daily_budget_cents: int
+    remaining_daily_budget_cents: float
     can_bid: bool
     start_date: datetime
     end_date: Optional[datetime]
@@ -112,6 +121,7 @@ class BidResponse(BaseModel):
     winning_campaign_id: Optional[str]
     winning_creative_id: Optional[str]
     clearing_price_cents: int           # What winner pays
+    charged_cost_micros: int = 0         # Exact charge for this impression
     highest_bid_cents: int
     num_bidders: int
     auction_type: AuctionType
@@ -127,7 +137,7 @@ class CampaignStats(BaseModel):
     impressions: int
     clicks: int
     ctr: float                          # Click-through rate %
-    total_spend_cents: int
+    total_spend_cents: float
     avg_cpm_cents: float
 
 class AuctionStats(BaseModel):
@@ -144,6 +154,7 @@ class RecentAuction(BaseModel):
     had_fill: bool
     num_bidders: int
     clearing_price_cents: int
+    charged_cost_micros: int
     highest_bid_cents: int
     created_at: datetime
     model_config = {"from_attributes": True}

@@ -35,6 +35,24 @@ Publisher (SSP)  →  Bid Request  →  RTB Engine  →  Auction Result
 - **Live A/B test** — every auction is randomly assigned to flat-CPM (control) or expected-value bidding (treatment); the dashboard compares their cost per click side by side
 - **Live dashboard** — 5-second auto-refresh with auction volume charts, campaign CTR, fill rate KPIs
 
+
+## Accounting Correctness
+
+Auction prices and campaign spend intentionally use different units:
+
+- Bids and clearing prices are integer **CPM cents** (cents per 1,000 impressions).
+- A filled auction is charged in integer **USD microdollars**. For example,
+  a 150-cent CPM becomes a 1,500-micro ($0.0015) impression charge.
+- Daily and lifetime spend are accumulated in microdollars, avoiding floats and
+  avoiding the 1,000x overcharge caused by treating a CPM quote as one impression.
+- Budget reservation is one conditional PostgreSQL update. Concurrent auctions
+  cannot reserve spend beyond either the campaign's daily or lifetime limit.
+- API and dashboard totals are converted back to cents only for presentation.
+
+The auction response exposes both `clearing_price_cents` (the CPM quote) and
+`charged_cost_micros` (the exact cost of that impression), making the unit
+boundary visible in the demo and auditable in tests.
+
 ## Machine Learning: CTR-Driven Bidding
 
 Real demand-side platforms don't bid a flat price — they bid what an impression is
@@ -140,12 +158,14 @@ curl -X POST http://localhost:8000/api/v1/auction/bid \
 
 1. Publisher fires `POST /auction/bid` when a user loads a page
 2. Engine fetches all **active campaigns** with remaining daily budget
-3. **Targeting filter** removes campaigns that don't match country/device
+3. **Eligibility filter** enforces campaign dates, advertiser status, country,
+   device, publisher category, budgets, and matching creative dimensions
 4. Each eligible campaign bids its `max_cpm_cents`
-5. **Second-price auction** — winner = highest bid, clearing price = 2nd highest + 1¢
-6. Winning campaign's budget is decremented
-7. Impression event fires to **Redis Stream** (async, never blocks response)
-8. Response returns auction result in **<100ms**
+5. Run the winner's configured first- or second-price auction
+6. Convert the clearing CPM to an exact per-impression microdollar charge
+7. Atomically reserve that charge against daily and lifetime budgets
+8. Impression event fires to **Redis Stream**
+9. Response returns the CPM quote, exact charge, and auction result
 
 ## Data Model
 
@@ -215,6 +235,6 @@ deployment but are unused on Render.
 
 - **Seed** wipes and rebuilds the dataset, so repeated clicks by visitors can't
   pile up duplicates.
-- **Budgets roll over automatically.** When every campaign has spent its daily
-  budget the next auction resets them, so the demo never gets stuck returning
-  "no fill" — this stands in for the daily cron a real DSP would run.
+- **Budgets roll over automatically.** Daily spend resets when the UTC date
+  changes; lifetime spend never resets, so neither limit can be bypassed by
+  repeatedly running auctions or reactivating a campaign.

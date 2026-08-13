@@ -115,6 +115,9 @@ export default function BidSimulator({ slots, onAuctionComplete }) {
                 ['Bidders', result.num_bidders],
                 ['Top bid', result.highest_bid_cents > 0 ? `$${(result.highest_bid_cents/100).toFixed(4)} CPM` : '—'],
                 ['Clearing price', result.clearing_price_cents > 0 ? `$${(result.clearing_price_cents/100).toFixed(4)} CPM` : '—'],
+                ['Impression cost', result.charged_cost_micros > 0
+                  ? `$${(result.charged_cost_micros / 1_000_000).toFixed(6)}`
+                  : '$0.000000'],
                 ['Latency', `${result.latency_ms}ms`],
                 ['Auction type', result.auction_type?.replace('_', ' ')],
                 ['Auction ID', result.auction_id.slice(0, 8) + '…'],

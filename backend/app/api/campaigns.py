@@ -5,6 +5,7 @@ import json
 from app.core.database import get_db
 from app.models.models import Campaign, CampaignStatus
 from app.schemas.schemas import CampaignCreate, CampaignOut
+from app.ml.artifacts import DEFAULT_BASELINE_CTR
 
 router = APIRouter()
 
@@ -16,6 +17,10 @@ async def create_campaign(payload: CampaignCreate, db: AsyncSession = Depends(ge
     data["target_countries"] = json.dumps(data["target_countries"])
     data["target_devices"] = json.dumps(data["target_devices"])
     data["target_categories"] = json.dumps(data["target_categories"])
+    if data["value_per_click_millicents"] is None:
+        data["value_per_click_millicents"] = round(
+            data["max_cpm_cents"] / DEFAULT_BASELINE_CTR
+        )
     campaign = Campaign(**data)
     db.add(campaign)
     await db.flush()
@@ -62,6 +67,5 @@ async def activate_campaign(campaign_id: str, db: AsyncSession = Depends(get_db)
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
     campaign.status = CampaignStatus.ACTIVE
-    campaign.spent_today_cents = 0  # Reset daily spend on re-activation
     await db.flush()
     return {"message": "Campaign activated", "campaign_id": campaign_id}

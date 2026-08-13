@@ -9,18 +9,16 @@ Hierarchy:
 """
 
 import uuid
-from datetime import datetime
-from decimal import Decimal
-
+from datetime import date, datetime
 from sqlalchemy import (
-    String, Numeric, Boolean, DateTime, ForeignKey,
-    Integer, Text, Enum as SAEnum, Index
+    String, Boolean, DateTime, ForeignKey,
+    Integer, BigInteger, Date, Text, Enum as SAEnum, Index
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy.dialects.postgresql import UUID
 import enum
 
 from app.core.database import Base
+from app.services.accounting import MICROS_PER_CENT, micros_to_cents
 
 
 def gen_uuid():
@@ -80,11 +78,15 @@ class Campaign(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[CampaignStatus] = mapped_column(SAEnum(CampaignStatus), default=CampaignStatus.ACTIVE)
 
-    # Budget — stored in USD cents to avoid floating point errors
+    # Budget limits use whole cents; spend uses integer microdollars because a
+    # single CPM-priced impression normally costs a fraction of one cent.
     daily_budget_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     total_budget_cents: Mapped[int] = mapped_column(Integer, nullable=False)
-    spent_today_cents: Mapped[int] = mapped_column(Integer, default=0)
-    total_spent_cents: Mapped[int] = mapped_column(Integer, default=0)
+    spent_today_micros: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    total_spent_micros: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    spend_date: Mapped[date] = mapped_column(
+        Date, default=lambda: datetime.utcnow().date(), nullable=False
+    )
 
     # Bidding
     max_cpm_cents: Mapped[int] = mapped_column(Integer, nullable=False)  # Max bid per 1000 impressions
@@ -113,14 +115,42 @@ class Campaign(Base):
     )
 
     @property
-    def remaining_daily_budget_cents(self) -> int:
-        return max(0, self.daily_budget_cents - self.spent_today_cents)
+    def daily_budget_micros(self) -> int:
+        return self.daily_budget_cents * MICROS_PER_CENT
+
+    @property
+    def total_budget_micros(self) -> int:
+        return self.total_budget_cents * MICROS_PER_CENT
+
+    @property
+    def spent_today_cents(self) -> float:
+        """Compatibility/reporting view; the database source is integer micros."""
+        return micros_to_cents(self.spent_today_micros)
+
+    @property
+    def total_spent_cents(self) -> float:
+        return micros_to_cents(self.total_spent_micros)
+
+    @property
+    def remaining_daily_budget_micros(self) -> int:
+        return max(0, self.daily_budget_micros - self.spent_today_micros)
+
+    @property
+    def remaining_total_budget_micros(self) -> int:
+        return max(0, self.total_budget_micros - self.total_spent_micros)
+
+    @property
+    def remaining_daily_budget_cents(self) -> float:
+        return micros_to_cents(self.remaining_daily_budget_micros)
 
     @property
     def can_bid(self) -> bool:
         return (
             self.status == CampaignStatus.ACTIVE
-            and self.remaining_daily_budget_cents > 0
+            and min(
+                self.remaining_daily_budget_micros,
+                self.remaining_total_budget_micros,
+            ) > 0
         )
 
 
@@ -215,7 +245,7 @@ class BidRecord(Base):
 class AuctionResult(Base):
     """
     The outcome of a completed auction.
-    Clearing price = what the winner actually pays (second-price logic).
+    The clearing CPM quote plus the exact per-impression amount charged.
     """
     __tablename__ = "auction_results"
 
@@ -225,7 +255,8 @@ class AuctionResult(Base):
     winning_campaign_id: Mapped[str] = mapped_column(ForeignKey("campaigns.id"), nullable=True)
     winning_creative_id: Mapped[str] = mapped_column(ForeignKey("ad_creatives.id"), nullable=True)
     highest_bid_cents: Mapped[int] = mapped_column(Integer, nullable=False)
-    clearing_price_cents: Mapped[int] = mapped_column(Integer, nullable=False)  # What winner pays
+    clearing_price_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    charged_cost_micros: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     num_bidders: Mapped[int] = mapped_column(Integer, default=0)
     strategy: Mapped[str] = mapped_column(String(20), default="control")  # control | treatment
     had_fill: Mapped[bool] = mapped_column(Boolean, default=False)  # False = no bids above floor
@@ -248,6 +279,7 @@ class Impression(Base):
     campaign_id: Mapped[str] = mapped_column(ForeignKey("campaigns.id"), nullable=False)
     ad_slot_id: Mapped[str] = mapped_column(ForeignKey("ad_slots.id"), nullable=False)
     clearing_price_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    charged_cost_micros: Mapped[int] = mapped_column(BigInteger, nullable=False)
     country: Mapped[str] = mapped_column(String(2), nullable=True)
     device_type: Mapped[str] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
