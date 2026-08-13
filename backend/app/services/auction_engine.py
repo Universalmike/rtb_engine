@@ -18,7 +18,7 @@ import uuid
 import time
 import json
 import random
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,13 +30,12 @@ from app.models.models import (
     BidRecord, AuctionResult, Impression,
 )
 from app.schemas.schemas import BidRequest, BidResponse, AuctionType
-from app.core.redis_client import get_redis, IMPRESSION_STREAM
+from app.core.redis_client import get_redis, IMPRESSION_STREAM, BID_STREAM
+from app.core.config import get_settings
 from app.ml.predictor import predict_ctr
-from app.services.accounting import (
-    MICROS_PER_CENT,
-    cpm_cents_to_impression_micros,
-    max_affordable_cpm_cents,
-)
+
+settings = get_settings()
+
 
 class AuctionEngine:
 
@@ -81,28 +80,6 @@ class AuctionEngine:
             await self._save_no_fill_result(auction_id, ad_slot, start_time, strategy)
             return self._no_fill_response(auction_id, bid_request, start_time, strategy)
 
-        # 4. Run the winner's configured auction type and atomically reserve
-        # the exact per-impression
-        # charge. A concurrent auction may spend a candidate's last budget
-        # after eligibility was read; in that case remove it and rerun.
-        result = None
-        charged_cost_micros = 0
-        while bids:
-            candidate_result = self._run_price_auction(bids, ad_slot)
-            candidate = candidate_result["winner"]
-            candidate_cost = cpm_cents_to_impression_micros(
-                candidate_result["clearing_price_cents"]
-            )
-            if await self._reserve_budget(candidate, candidate_cost):
-                result = candidate_result
-                charged_cost_micros = candidate_cost
-                break
-            bids = [bid for bid in bids if bid["campaign"].id != candidate.id]
-
-        if result is None:
-            await self._save_no_fill_result(auction_id, ad_slot, start_time, strategy)
-            return self._no_fill_response(auction_id, bid_request, start_time, strategy)
-
         winning_campaign = result["winner"]
         clearing_price = result["clearing_price_cents"]
 
@@ -115,8 +92,7 @@ class AuctionEngine:
         # 7. Save auction result
         await self._save_auction_result(
             auction_id, ad_slot, winning_campaign, creative,
-            result["highest_bid_cents"], clearing_price, charged_cost_micros,
-            len(bids), strategy
+            result["highest_bid_cents"], clearing_price, len(bids), strategy
         )
 
         # 8. Save the impression and emit its event.
@@ -268,23 +244,16 @@ class AuctionEngine:
         """
         bids = []
         for campaign in campaigns:
-            if self._pick_creative(campaign, ad_slot) is None:
-                continue
-            remaining_micros = min(
-                campaign.remaining_daily_budget_micros,
-                campaign.remaining_total_budget_micros,
-            )
-            affordable_cpm = max_affordable_cpm_cents(remaining_micros)
             if strategy == "treatment":
                 ev_cpm = round(pctr * campaign.value_per_click_millicents)
                 bid_amount = min(
                     ev_cpm, campaign.max_cpm_cents,
-                    affordable_cpm,
+                    campaign.remaining_daily_budget_cents,
                 )
             else:
                 bid_amount = min(
                     campaign.max_cpm_cents,
-                    affordable_cpm,
+                    campaign.remaining_daily_budget_cents,
                 )
             if bid_amount >= ad_slot.floor_price_cents:
                 bids.append({"campaign": campaign, "bid_cents": bid_amount})
@@ -348,8 +317,7 @@ class AuctionEngine:
 
     async def _save_auction_result(
         self, auction_id, ad_slot, winning_campaign,
-        creative, highest_bid, clearing_price, charged_cost_micros,
-        num_bidders, strategy
+        creative, highest_bid, clearing_price, num_bidders, strategy
     ):
         result = AuctionResult(
             auction_id=auction_id,

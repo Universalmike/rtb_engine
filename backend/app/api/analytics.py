@@ -128,7 +128,7 @@ async def get_timeseries(db: AsyncSession = Depends(get_db)):
 def build_ab_comparison(imp_rows, clk_rows) -> list[dict]:
     """Shape raw per-strategy rows into A/B metrics for both arms.
 
-    imp_rows: iterable of (strategy, impressions, spend_micros)
+    imp_rows: iterable of (strategy, impressions, spend_cents)
     clk_rows: iterable of (strategy, clicks)
 
     The headline metric is effective CPC (spend / clicks): EV bidding pays less
@@ -136,24 +136,22 @@ def build_ab_comparison(imp_rows, clk_rows) -> list[dict]:
     context but is near-equal across arms by construction — click probability
     depends on the auction context, which is assigned independently of the arm.
     """
-    imps = {s: (n, spend_micros) for s, n, spend_micros in imp_rows}
+    imps = {s: (n, spend) for s, n, spend in imp_rows}
     clks = {s: c for s, c in clk_rows}
     out = []
     for strategy in ("control", "treatment"):
-        n, spend_micros = imps.get(strategy, (0, 0))
+        n, spend = imps.get(strategy, (0, 0))
         n = int(n or 0)
-        spend_cents = micros_to_cents(int(spend_micros or 0))
+        spend = int(spend or 0)
         clicks = int(clks.get(strategy, 0))
         out.append({
             "strategy": strategy,
             "impressions": n,
             "clicks": clicks,
-            "spend_cents": spend_cents,
+            "spend_cents": spend,
             "ctr": (clicks / n) if n else 0.0,
-            "eff_cpc_cents": (spend_cents / clicks) if clicks else None,
-            "clicks_per_1000_cents": (
-                clicks * 1000 / spend_cents if spend_cents else 0.0
-            ),
+            "eff_cpc_cents": (spend / clicks) if clicks else None,
+            "clicks_per_1000_cents": (clicks * 1000 / spend) if spend else 0.0,
         })
     return out
 
@@ -167,7 +165,7 @@ async def ab_comparison(db: AsyncSession = Depends(get_db)):
         select(
             AuctionResult.strategy,
             func.count(Impression.id),
-            func.sum(Impression.charged_cost_micros),
+            func.sum(Impression.clearing_price_cents),
         )
         .join(Impression, Impression.auction_id == AuctionResult.auction_id)
         .group_by(AuctionResult.strategy)
