@@ -9,7 +9,7 @@ Hierarchy:
 """
 
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from sqlalchemy import (
     String, Boolean, DateTime, ForeignKey,
     Integer, BigInteger, Date, Text, Enum as SAEnum, Index
@@ -133,7 +133,19 @@ class Campaign(Base):
 
     @property
     def remaining_daily_budget_micros(self) -> int:
-        return max(0, self.daily_budget_micros - self.spent_today_micros)
+        """Today's remaining daily budget.
+
+        Spend carried from an earlier day has effectively rolled over already;
+        the row is only rewritten when the campaign is next charged, so a
+        stale spend_date must read as zero spent rather than yesterday's
+        total. See AuctionEngine._spent_today_expression for the SQL twin.
+        """
+        spent = (
+            self.spent_today_micros
+            if self.spend_date == datetime.now(timezone.utc).date()
+            else 0
+        )
+        return max(0, self.daily_budget_micros - spent)
 
     @property
     def remaining_total_budget_micros(self) -> int:

@@ -17,6 +17,8 @@ mechanism used by Google Ad Exchange, AppNexus, and most major DSPs.
 import uuid
 import time
 import json
+import logging
+import os
 import random
 from datetime import datetime, timezone
 from typing import Optional
@@ -32,6 +34,12 @@ from app.models.models import (
 from app.schemas.schemas import BidRequest, BidResponse, AuctionType
 from app.core.redis_client import get_redis, IMPRESSION_STREAM
 from app.ml.predictor import predict_ctr
+logger = logging.getLogger(__name__)
+
+# Phase timings are always logged; set AUCTION_PROFILE=1 to also return them on
+# the response, which is how you read them from Swagger without server logs.
+PROFILE_AUCTIONS = os.getenv("AUCTION_PROFILE", "").lower() in {"1", "true", "yes"}
+
 from app.services.accounting import (
     MICROS_PER_CENT,
     cpm_cents_to_impression_micros,
@@ -45,19 +53,58 @@ class AuctionEngine:
         self.redis = get_redis()
 
     async def run_auction(self, bid_request: BidRequest) -> BidResponse:
-        """
-        Main auction flow. Returns a BidResponse in under 100ms (our SLA).
+        """Main auction flow, wrapped in per-phase timing.
+
+        The 100ms figure this engine targets is a compute budget. On a
+        deployed instance the wall clock is dominated by sequential database
+        round-trips instead, which is exactly what the phase breakdown is
+        here to expose: each entry is the ms spent between two steps, so a
+        single slow round-trip is visible rather than buried in one total.
         """
         start_time = time.monotonic()
         auction_id = str(uuid.uuid4())
+        phases: dict[str, float] = {}
+        mark = self._phase_marker(phases)
 
+        try:
+            response = await self._execute_auction(
+                auction_id, bid_request, start_time, mark
+            )
+        finally:
+            logger.info(
+                "auction=%s total_ms=%.2f phases_ms=%s",
+                auction_id, (time.monotonic() - start_time) * 1000, phases,
+            )
+
+        if PROFILE_AUCTIONS:
+            response.timings_ms = phases
+        return response
+
+    @staticmethod
+    def _phase_marker(phases: dict):
+        """Returns mark(name): records ms elapsed since the previous mark."""
+        previous = [time.monotonic()]
+
+        def mark(name: str) -> None:
+            now = time.monotonic()
+            phases[name] = round((now - previous[0]) * 1000, 2)
+            previous[0] = now
+
+        return mark
+
+    async def _execute_auction(
+        self, auction_id: str, bid_request: BidRequest,
+        start_time: float, mark,
+    ) -> BidResponse:
         # 1. Fetch the ad slot
         ad_slot = await self._get_ad_slot(bid_request.ad_slot_id)
+        mark("fetch_slot")
         if not ad_slot:
             return self._no_fill_response(auction_id, bid_request, start_time, "control")
 
         # 2. Get eligible campaigns
         eligible_campaigns = await self._get_eligible_campaigns(bid_request, ad_slot)
+        mark("eligibility_query")
 
         if not eligible_campaigns:
             await self._save_no_fill_result(auction_id, ad_slot, start_time, "control")
@@ -73,9 +120,11 @@ class AuctionEngine:
             banner_pos=ad_slot.banner_pos,
             hour=datetime.utcnow().hour,
         )
+        mark("predict_ctr")
 
         # 3. Collect bids under the assigned strategy
         bids = self._collect_bids(eligible_campaigns, ad_slot, strategy, pctr)
+        mark("collect_bids")
 
         if not bids:
             await self._save_no_fill_result(auction_id, ad_slot, start_time, strategy)
@@ -98,6 +147,7 @@ class AuctionEngine:
                 charged_cost_micros = candidate_cost
                 break
             bids = [bid for bid in bids if bid["campaign"].id != candidate.id]
+        mark("reserve_budget")
 
         if result is None:
             await self._save_no_fill_result(auction_id, ad_slot, start_time, strategy)
@@ -111,6 +161,7 @@ class AuctionEngine:
 
         # 6. Save bid records (all bids, win/lose)
         await self._save_bid_records(auction_id, bids)
+        mark("save_bid_records")
 
         # 7. Save auction result
         await self._save_auction_result(
@@ -118,12 +169,14 @@ class AuctionEngine:
             result["highest_bid_cents"], clearing_price, charged_cost_micros,
             len(bids), strategy
         )
+        mark("save_auction_result")
 
         # 8. Save the impression and emit its event.
         await self._emit_impression_event(
             auction_id, winning_campaign, ad_slot, clearing_price,
             charged_cost_micros, bid_request
         )
+        mark("emit_impression")
 
         latency = (time.monotonic() - start_time) * 1000
 
@@ -161,7 +214,6 @@ class AuctionEngine:
         - Has remaining daily budget
         - Bid floor is above the slot's floor price
         """
-        await self._rollover_daily_budgets()
         campaigns = await self._query_solvent_campaigns(ad_slot)
 
         # Apply targeting filters
@@ -173,21 +225,33 @@ class AuctionEngine:
         return eligible
 
     async def _query_solvent_campaigns(self, ad_slot: AdSlot) -> list[Campaign]:
-        """Active campaigns with budget left that can clear the slot's floor."""
+        """Active campaigns with budget left that can clear the slot's floor.
+
+        A campaign whose spend_date predates today has spent nothing *today*,
+        so its daily spend is zeroed inline rather than by rewriting the row
+        first. For the same reason a campaign that exhausted its daily budget
+        on an earlier day is admitted again here: the new day resets it.
+        """
         now = datetime.utcnow()
         today = datetime.now(timezone.utc).date()
         minimum_charge = cpm_cents_to_impression_micros(ad_slot.floor_price_cents)
+        spent_today = self._spent_today_expression(today)
         result = await self.db.execute(
             select(Campaign)
             .join(Advertiser, Campaign.advertiser_id == Advertiser.id)
             .where(
                 and_(
-                    Campaign.status == CampaignStatus.ACTIVE,
+                    or_(
+                        Campaign.status == CampaignStatus.ACTIVE,
+                        and_(
+                            Campaign.status == CampaignStatus.EXHAUSTED,
+                            Campaign.spend_date < today,
+                        ),
+                    ),
                     Advertiser.is_active == True,
                     Campaign.start_date <= now,
                     or_(Campaign.end_date.is_(None), Campaign.end_date > now),
-                    Campaign.spend_date == today,
-                    Campaign.spent_today_micros + minimum_charge
+                    spent_today + minimum_charge
                     <= cast(Campaign.daily_budget_cents, BigInteger)
                     * MICROS_PER_CENT,
                     Campaign.total_spent_micros + minimum_charge
@@ -200,30 +264,18 @@ class AuctionEngine:
         )
         return list(result.scalars().all())
 
-    async def _rollover_daily_budgets(self) -> None:
-        """Reset daily spend once per UTC day; lifetime spend is never reset."""
-        today = datetime.now(timezone.utc).date()
-        await self.db.execute(
-            update(Campaign)
-            .where(
-                Campaign.spend_date < today,
-                Campaign.total_spent_micros
-                < cast(Campaign.total_budget_cents, BigInteger)
-                * MICROS_PER_CENT,
-            )
-            .values(
-                status=case(
-                    (Campaign.status == CampaignStatus.EXHAUSTED,
-                     literal(
-                         CampaignStatus.ACTIVE,
-                         type_=Campaign.status.type,
-                     )),
-                    else_=Campaign.status,
-                ),
-                spent_today_micros=0,
-                spend_date=today,
-            )
-            .execution_options(synchronize_session=False)
+    @staticmethod
+    def _spent_today_expression(today):
+        """Daily spend as of `today`, treating a stale spend_date as zero.
+
+        Rollover used to be a table-wide UPDATE issued before every auction,
+        purely so this could be read as a plain column: a write, and row
+        locks, on the hot path of every bid request. Expressed as a CASE the
+        read path stays read-only; _reserve_budget persists the reset.
+        """
+        return case(
+            (Campaign.spend_date == today, Campaign.spent_today_micros),
+            else_=literal(0, type_=BigInteger),
         )
 
     def _passes_targeting(
@@ -367,8 +419,17 @@ class AuctionEngine:
         await self.db.flush()
 
     async def _reserve_budget(self, campaign: Campaign, charge_micros: int) -> bool:
-        """Atomically reserve spend without crossing daily or lifetime limits."""
-        new_daily_spend = Campaign.spent_today_micros + charge_micros
+        """Atomically reserve spend without crossing daily or lifetime limits.
+
+        This single UPDATE also performs the campaign's daily rollover: when
+        spend_date is stale, today's spend starts from zero and the row is
+        stamped with today's date as it is charged. Keeping the reset in the
+        same conditional UPDATE makes it atomic per row, so concurrent
+        auctions cannot race it into double-spending.
+        """
+        today = datetime.now(timezone.utc).date()
+        spent_today = self._spent_today_expression(today)
+        new_daily_spend = spent_today + charge_micros
         new_total_spend = Campaign.total_spent_micros + charge_micros
         daily_limit = (
             cast(Campaign.daily_budget_cents, BigInteger) * MICROS_PER_CENT
@@ -376,20 +437,25 @@ class AuctionEngine:
         total_limit = (
             cast(Campaign.total_budget_cents, BigInteger) * MICROS_PER_CENT
         )
-        today = datetime.now(timezone.utc).date()
 
         reservation = await self.db.execute(
             update(Campaign)
             .where(
                 Campaign.id == campaign.id,
-                Campaign.status == CampaignStatus.ACTIVE,
-                Campaign.spend_date == today,
+                or_(
+                    Campaign.status == CampaignStatus.ACTIVE,
+                    and_(
+                        Campaign.status == CampaignStatus.EXHAUSTED,
+                        Campaign.spend_date < today,
+                    ),
+                ),
                 new_daily_spend <= daily_limit,
                 new_total_spend <= total_limit,
             )
             .values(
                 spent_today_micros=new_daily_spend,
                 total_spent_micros=new_total_spend,
+                spend_date=today,
                 status=case(
                     (or_(new_daily_spend >= daily_limit,
                          new_total_spend >= total_limit),
@@ -397,7 +463,10 @@ class AuctionEngine:
                          CampaignStatus.EXHAUSTED,
                          type_=Campaign.status.type,
                      )),
-                    else_=Campaign.status,
+                    else_=literal(
+                        CampaignStatus.ACTIVE,
+                        type_=Campaign.status.type,
+                    ),
                 ),
             )
             .returning(

@@ -127,6 +127,8 @@ class BidResponse(BaseModel):
     auction_type: AuctionType
     latency_ms: float                   # How long the auction took
     strategy: str = "control"           # which A/B arm ran this auction
+    # Per-phase ms breakdown, present only when AUCTION_PROFILE=1 is set.
+    timings_ms: Optional[dict[str, float]] = None
 
 
 # ─── Analytics ────────────────────────────────────────────────────────────────
