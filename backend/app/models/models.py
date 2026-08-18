@@ -112,6 +112,11 @@ class Campaign(Base):
 
     __table_args__ = (
         Index("ix_campaigns_advertiser_status", "advertiser_id", "status"),
+        # Every auction opens by selecting solvent campaigns on status, then
+        # comparing spend_date against today. The advertiser_status index
+        # cannot serve that: advertiser_id leads it and the auction never
+        # filters on one.
+        Index("ix_campaigns_status_spend_date", "status", "spend_date"),
     )
 
     @property

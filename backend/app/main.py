@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
-from app.core.database import engine, ensure_schema
+from app.core.database import engine, ensure_schema, warm_connection_pool
 from app.core.config import get_settings
 
 settings = get_settings()
@@ -26,6 +26,14 @@ async def lifespan(app: FastAPI):
         print("[startup] Database tables ready")
     except Exception as e:
         print(f"[startup] Schema init failed (continuing so /health stays up): {e}")
+
+    # Pay the connection handshakes here, where nobody is waiting on them,
+    # instead of inside the first visitor's auction.
+    try:
+        opened = await warm_connection_pool()
+        print(f"[startup] Connection pool warm ({opened} connections)")
+    except Exception as e:
+        print(f"[startup] Pool warm-up skipped: {e}")
     yield
     # Shutdown: dispose connection pool
     await engine.dispose()

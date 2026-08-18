@@ -1,5 +1,7 @@
+import asyncio
 import os
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.pool import NullPool
@@ -54,6 +56,39 @@ async def ensure_schema() -> None:
     """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
+async def warm_connection_pool() -> None:
+    """Establish every pooled connection at boot rather than on first use.
+
+    Opening a connection to a hosted Postgres costs a TCP and TLS handshake.
+    Left lazy, that cost is paid by whoever first loads the dashboard — and
+    the dashboard opens seven requests at once, so it is paid several times
+    over, *inside* the auction the visitor is waiting on. Free-tier hosts
+    spin containers down when idle, which makes that first visitor the common
+    case rather than a rare one.
+
+    Connections are opened concurrently and held simultaneously, otherwise
+    each would simply check the same pooled connection back out. Failures are
+    not fatal: this is an optimisation, and /health reports real outages.
+    """
+    if IS_SERVERLESS:
+        return 0  # NullPool holds nothing between requests; nothing to warm
+
+    size = engine.pool.size()
+    connections = await asyncio.gather(
+        *(engine.connect() for _ in range(size)), return_exceptions=True
+    )
+    live = [c for c in connections if not isinstance(c, BaseException)]
+    try:
+        await asyncio.gather(
+            *(c.execute(text("SELECT 1")) for c in live), return_exceptions=True
+        )
+    finally:
+        await asyncio.gather(
+            *(c.close() for c in live), return_exceptions=True
+        )
+    return len(live)
 
 
 async def reset_schema() -> None:

@@ -25,7 +25,7 @@ from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import BigInteger, and_, case, cast, literal, or_, select, update
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import joinedload
 
 from app.models.models import (
     Advertiser, Campaign, CampaignStatus, AdSlot, AdCreative,
@@ -178,6 +178,12 @@ class AuctionEngine:
         )
         mark("emit_impression")
 
+        # Bid records, auction result and impression were queued, not written.
+        # One flush sends them together: three round trips become one. It stays
+        # inside the timed section so latency_ms keeps reporting real work.
+        await self.db.flush()
+        mark("persist")
+
         latency = (time.monotonic() - start_time) * 1000
 
         return BidResponse(
@@ -201,7 +207,7 @@ class AuctionEngine:
         result = await self.db.execute(
             select(AdSlot)
             .where(AdSlot.id == slot_id, AdSlot.is_active == True)
-            .options(selectinload(AdSlot.publisher))
+            .options(joinedload(AdSlot.publisher))
         )
         return result.scalar_one_or_none()
 
@@ -260,9 +266,11 @@ class AuctionEngine:
                     Campaign.max_cpm_cents >= ad_slot.floor_price_cents,
                 )
             )
-            .options(selectinload(Campaign.creatives))
+            .options(joinedload(Campaign.creatives))
         )
-        return list(result.scalars().all())
+        # joinedload on a collection repeats the parent row per child, so the
+        # identity map has to de-duplicate before we materialise the list.
+        return list(result.unique().scalars().all())
 
     @staticmethod
     def _spent_today_expression(today):
@@ -396,7 +404,6 @@ class AuctionEngine:
                 is_winner=(i == 0),
             )
             self.db.add(record)
-        await self.db.flush()
 
     async def _save_auction_result(
         self, auction_id, ad_slot, winning_campaign,
@@ -416,7 +423,6 @@ class AuctionEngine:
             strategy=strategy,
         )
         self.db.add(result)
-        await self.db.flush()
 
     async def _reserve_budget(self, campaign: Campaign, charge_micros: int) -> bool:
         """Atomically reserve spend without crossing daily or lifetime limits.
@@ -506,7 +512,6 @@ class AuctionEngine:
                 device_type=bid_request.device_type.value,
             )
             self.db.add(impression)
-            await self.db.flush()
 
             # Emit to Redis Stream for real-time consumers
             await self.redis.xadd(IMPRESSION_STREAM, {
