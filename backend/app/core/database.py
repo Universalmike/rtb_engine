@@ -23,26 +23,30 @@ pool_args = (
 )
 
 def uses_transaction_pooler(database_url: str) -> bool:
-    """Whether this endpoint multiplexes connections mid-transaction.
+    """Whether prepared statements must not be cached against this endpoint.
 
-    A transaction-mode pooler hands a different backend connection to each
-    transaction, so a prepared statement created by one client is not there
-    for the next. asyncpg must not cache statements against one.
+    asyncpg caches prepared statements per connection. That only pays off if a
+    statement survives from one checkout to the next, which requires the same
+    backend connection each time.
 
-    The distinction is the *endpoint*, not the vendor. Supabase serves all
-    three of these:
+    Measured against Supabase's session pooler (port 5432), it does not: with
+    caching enabled the auction ran 2.2x slower (104ms -> 230ms), and the
+    first query of each request cost 4x more (35ms -> 142ms) with no warm-up
+    at all between calls -- the statement was being re-prepared every request.
+    Session mode is documented as prepared-statement safe, but the pooler
+    evidently does not hand back the same backend connection, so the cache
+    never hits and only the PREPARE round trip remains.
 
-      db.<ref>.supabase.co:5432            direct        prepared statements OK
-      aws-0-<region>.pooler.supabase.com:5432  session   prepared statements OK
-      aws-0-<region>.pooler.supabase.com:6543  transaction      must not cache
+    So the rule is any pgBouncer-fronted endpoint, not just transaction mode:
 
-    Only the port separates the last two. Neon instead marks its pooled
-    endpoint in the hostname ('-pooler.'). Matching the vendor name, as this
-    previously did, disabled the cache on direct and session connections that
-    could have used it -- and every query then pays re-parse and re-plan.
+      db.<ref>.supabase.co:5432                direct       may cache
+      <region>.pooler.supabase.com:5432        session      must not cache
+      <region>.pooler.supabase.com:6543        transaction  must not cache
+      ep-<id>-pooler.<region>.aws.neon.tech    Neon pooled  must not cache
 
     An unparseable URL returns True: disabling the cache costs performance,
-    while wrongly enabling it against a transaction pooler is a runtime error.
+    while wrongly enabling it is both slower and, on transaction mode, an
+    outright runtime error.
     """
     try:
         parts = urlsplit(database_url)
@@ -51,9 +55,9 @@ def uses_transaction_pooler(database_url: str) -> bool:
     except ValueError:
         return True
 
-    if port == 6543:            # Supabase transaction pooler
+    if "pooler." in host:   # Supabase (either mode) and Neon's pooled endpoint
         return True
-    if "-pooler." in host:      # Neon pooled endpoint
+    if port == 6543:        # transaction pooler on an unrecognised host
         return True
     return False
 
