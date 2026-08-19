@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { Activity, Database, Users, TrendingUp, RefreshCw, Loader } from 'lucide-react'
 import StatCard from './components/StatCard'
 import AuctionChart from './components/AuctionChart'
@@ -12,11 +12,47 @@ import {
   API_URL_MISSING
 } from './api'
 
-function useInterval(fn, ms) {
+// Polls `fn`, scheduling the next run only once the previous one has settled.
+//
+// setInterval fires on a fixed clock whether or not the last cycle finished.
+// A cycle here is seven parallel requests, each holding a server connection
+// for its whole duration, so as soon as a cycle outlasts the interval -- a
+// cold backend, a contended pool, a slow query -- cycles overlap and stack:
+// 7 in flight becomes 14, then 21, against a pool of 10. Everything else then
+// queues waiting for a connection, and because that wait happens inside the
+// query it is charged to whatever request is unlucky enough to be holding it.
+// A bid request submitted during a pileup reports the queue time as auction
+// latency. Chaining the polls makes overlap impossible.
+function usePolling(fn, ms) {
   useEffect(() => {
-    fn()
-    const id = setInterval(fn, ms)
-    return () => clearInterval(id)
+    let cancelled = false
+    let timer
+
+    const tick = async () => {
+      // Nobody is reading a hidden tab. Skip the work but keep the loop alive
+      // so it picks straight back up when the tab returns.
+      if (document.visibilityState === 'visible') {
+        try { await fn() } catch { /* fn surfaces its own errors */ }
+      }
+      if (!cancelled) timer = setTimeout(tick, ms)
+    }
+    tick()
+
+    // Coming back to the tab should refresh now, not after the remainder of
+    // an interval that elapsed while it was hidden.
+    const onVisibilityChange = () => {
+      if (!cancelled && document.visibilityState === 'visible') {
+        clearTimeout(timer)
+        tick()
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+    }
   }, [])
 }
 
@@ -38,7 +74,16 @@ export default function App() {
   const [status, setStatus]           = useState(STATUS.CONNECTING)
   const [errorDetail, setErrorDetail] = useState(null)
 
+  const refreshing = useRef(false)
+
   const refresh = useCallback(async () => {
+    // One refresh at a time, whoever asks. The polling loop is not the only
+    // caller -- the seed button and the bid simulator both refresh on
+    // completion -- and two overlapping cycles are fourteen concurrent
+    // requests against a pool of ten. Dropping the duplicate is right rather
+    // than merely cheap: the in-flight cycle is already fetching this data.
+    if (refreshing.current) return
+    refreshing.current = true
     try {
       const [ov, cs, ts, ra, sl, ac, ab] = await Promise.all([
         fetchOverview(),
@@ -69,11 +114,14 @@ export default function App() {
             ? 'The API did not respond in time. It may be a cold start — retrying automatically.'
             : `Could not reach the API${e.response ? ` (HTTP ${e.response.status})` : ''}. Retrying automatically.`
       )
+    } finally {
+      refreshing.current = false
     }
   }, [])
 
-  // Auto-refresh every 5 seconds
-  useInterval(refresh, 5000)
+  // Ten seconds, not five: nothing on this dashboard changes meaningfully in
+  // five, and each cycle costs seven requests and about a dozen queries.
+  usePolling(refresh, 10000)
 
   const handleSeed = async () => {
     setSeeding(true)
