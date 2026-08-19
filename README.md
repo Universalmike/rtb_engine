@@ -18,7 +18,7 @@ Publisher (SSP)  →  Bid Request  →  RTB Engine  →  Auction Result
 
 | Layer | Technology | Why |
 |-------|-----------|-----|
-| API | FastAPI (async) | Sub-100ms P99 latency requirement |
+| API | FastAPI (async) | An auction is ~150ms of waiting on Postgres and ~0.1ms of compute |
 | Database | PostgreSQL + SQLAlchemy | ACID transactions for billing accuracy |
 | Cache/Streams | Redis + Redis Streams | Event pipeline for impressions/clicks |
 | Frontend | React + Recharts | Live dashboard with auto-refresh |
@@ -185,10 +185,18 @@ The backend runs on **Render** (a long-lived container) and the frontend on
 ### Backend — Render
 
 `render.yaml` provisions a web service in the **Oregon** region so it sits next to
-the Supabase database (`us-west-2`). Colocation matters: an auction makes several
-sequential database round trips, so a cross-country hop turned a sub-100ms auction
-into ~3s. On a long-lived host the connection pool stays warm, so that connection
-cost is paid once at boot instead of on every request.
+the Supabase database (`us-west-2`). Colocation matters: an auction makes four
+sequential database round trips, and a cross-region hop multiplies every one of
+them.
+
+Measured on the deployed stack, a warm auction runs **~150ms end-to-end, of which
+~0.1ms is compute** — everything else is waiting on Postgres. The connection pool
+is warmed at boot so connection setup is paid once rather than inside the first
+visitor's auction. Free-tier containers still spin down when idle, and a cold
+start adds several seconds on top of that.
+
+Set `AUCTION_PROFILE=1` to get a per-phase millisecond breakdown on every bid
+response; it is always written to the logs regardless.
 
 | Setting | Value |
 |---------|-------|

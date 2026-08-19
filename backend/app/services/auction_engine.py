@@ -55,11 +55,12 @@ class AuctionEngine:
     async def run_auction(self, bid_request: BidRequest) -> BidResponse:
         """Main auction flow, wrapped in per-phase timing.
 
-        The 100ms figure this engine targets is a compute budget. On a
-        deployed instance the wall clock is dominated by sequential database
-        round-trips instead, which is exactly what the phase breakdown is
-        here to expose: each entry is the ms spent between two steps, so a
-        single slow round-trip is visible rather than buried in one total.
+        This path is I/O bound, not compute bound. A warm auction on the
+        deployed stack measures ~150ms end-to-end, of which ~0.1ms is compute;
+        the rest is four sequential database round trips. The per-phase
+        breakdown exists to keep that visible: each entry is the ms spent
+        between two steps, so one slow trip shows up instead of being buried
+        in a single total.
         """
         start_time = time.monotonic()
         auction_id = str(uuid.uuid4())

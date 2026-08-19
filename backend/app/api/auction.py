@@ -16,7 +16,10 @@ async def submit_bid_request(
 ):
     """
     Core RTB endpoint. A publisher fires this when a user loads a page.
-    The engine runs a full auction and returns the winner in <100ms.
+
+    The engine runs a full auction and returns the winner. Warm, that measures
+    ~150ms on the deployed free tier: four database round trips and roughly
+    0.1ms of compute. Set AUCTION_PROFILE=1 for the per-phase breakdown.
     """
     engine = AuctionEngine(db)
     return await engine.run_auction(bid_request)
