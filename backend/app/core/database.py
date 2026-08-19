@@ -1,5 +1,6 @@
 import asyncio
 import os
+from urllib.parse import urlsplit
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
@@ -21,11 +22,56 @@ pool_args = (
     else {"pool_size": 5, "max_overflow": 5, "pool_pre_ping": True}
 )
 
-# pgBouncer in transaction mode can't use prepared statements. Supabase's
-# pooler and Neon both need this; harmless on a direct connection.
-connect_args = {}
-if "supabase" in settings.DATABASE_URL or "pooler" in settings.DATABASE_URL:
-    connect_args = {"statement_cache_size": 0, "prepared_statement_cache_size": 0}
+def uses_transaction_pooler(database_url: str) -> bool:
+    """Whether this endpoint multiplexes connections mid-transaction.
+
+    A transaction-mode pooler hands a different backend connection to each
+    transaction, so a prepared statement created by one client is not there
+    for the next. asyncpg must not cache statements against one.
+
+    The distinction is the *endpoint*, not the vendor. Supabase serves all
+    three of these:
+
+      db.<ref>.supabase.co:5432            direct        prepared statements OK
+      aws-0-<region>.pooler.supabase.com:5432  session   prepared statements OK
+      aws-0-<region>.pooler.supabase.com:6543  transaction      must not cache
+
+    Only the port separates the last two. Neon instead marks its pooled
+    endpoint in the hostname ('-pooler.'). Matching the vendor name, as this
+    previously did, disabled the cache on direct and session connections that
+    could have used it -- and every query then pays re-parse and re-plan.
+
+    An unparseable URL returns True: disabling the cache costs performance,
+    while wrongly enabling it against a transaction pooler is a runtime error.
+    """
+    try:
+        parts = urlsplit(database_url)
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        return True
+
+    if port == 6543:            # Supabase transaction pooler
+        return True
+    if "-pooler." in host:      # Neon pooled endpoint
+        return True
+    return False
+
+
+# Escape hatch: if an endpoint is misdetected in production, flip this without
+# a code change. Unset means the URL decides.
+_cache_override = os.getenv("DB_DISABLE_STATEMENT_CACHE")
+DISABLE_STATEMENT_CACHE = (
+    _cache_override.lower() in {"1", "true", "yes"}
+    if _cache_override is not None
+    else uses_transaction_pooler(settings.DATABASE_URL)
+)
+
+connect_args = (
+    {"statement_cache_size": 0, "prepared_statement_cache_size": 0}
+    if DISABLE_STATEMENT_CACHE
+    else {}
+)
 
 engine = create_async_engine(
     settings.async_database_url,

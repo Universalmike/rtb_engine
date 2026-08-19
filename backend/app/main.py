@@ -3,7 +3,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
-from app.core.database import engine, ensure_schema, warm_connection_pool
+from app.core.database import (
+    DISABLE_STATEMENT_CACHE, engine, ensure_schema, warm_connection_pool,
+)
 from app.core.config import get_settings
 
 settings = get_settings()
@@ -29,6 +31,13 @@ async def lifespan(app: FastAPI):
 
     # Pay the connection handshakes here, where nobody is waiting on them,
     # instead of inside the first visitor's auction.
+    # Which endpoint mode was detected decides whether Postgres can reuse
+    # query plans, so make it visible rather than something to infer.
+    print(
+        "[startup] Prepared statement cache: "
+        + ("disabled (transaction pooler)" if DISABLE_STATEMENT_CACHE
+           else "enabled (direct or session endpoint)")
+    )
     try:
         opened = await warm_connection_pool()
         print(f"[startup] Connection pool warm ({opened} connections)")
