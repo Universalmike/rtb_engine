@@ -139,6 +139,56 @@ curl -X POST http://localhost:8000/api/v1/auction/bid \
   }'
 ```
 
+### Targeting
+
+A campaign bids only when every targeting rule it sets matches the request. An
+empty list means no restriction, so a campaign with no rules bids on
+everything — that is how the run-of-network campaigns in the seed backstop the
+auction.
+
+| Field | Matches against | Semantics |
+|-------|-----------------|-----------|
+| `target_countries` | `country` | allow list |
+| `target_devices` | `device_type` | allow list |
+| `target_categories` | the publisher's category | allow list |
+| `target_domains` | domain of `page_url` | allow list — contextual buying |
+| `blocked_domains` | domain of `page_url` | block list — brand safety |
+
+`page_url` is the page the ad would appear on, OpenRTB's `site.domain`. Two
+things follow from how buyers actually think about it:
+
+- **A domain covers its subdomains.** Buying `example.com` also buys
+  `sports.example.com` — a buyer means the publisher, not one hostname. The
+  suffix test is anchored on a dot, so `example.com` never matches
+  `notexample.com`.
+- **A block beats an allow.** An advertiser that will not appear beside a
+  domain does not appear there for any other reason, so `blocked_domains` is
+  checked first and vetoes.
+
+Contextual targeting that cannot be verified is not treated as a match: if the
+URL has no readable domain, a campaign with a `target_domains` list does not
+bid, while one that only blocks is unaffected.
+
+### Why a campaign did not bid
+
+`num_bidders` alone cannot distinguish a rule that fired from a field that is
+ignored, so every bid response carries a count of the rules that rejected the
+campaigns which did not bid:
+
+```json
+"num_bidders": 2,
+"excluded": { "domain": 4, "country": 6, "creative": 1, "floor": 2 }
+```
+
+Keys are the targeting field names above, plus `creative` (no creative matching
+the slot's dimensions) and `floor` (wanted the impression but could not clear
+the floor price, from its own cap or what is left of its budget). Campaigns
+filtered in SQL for budget, status or flight dates never reach the auction and
+are not counted.
+
+Ad slots report `publisher_domain`, since a bid request's `page_url` should be
+a page on the site that owns the inventory.
+
 ## API Reference
 
 | Method | Endpoint | Description |

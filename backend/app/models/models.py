@@ -101,6 +101,13 @@ class Campaign(Base):
     target_countries: Mapped[str] = mapped_column(Text, default="[]")    # JSON array e.g. ["NG","US","GB"]
     target_devices: Mapped[str] = mapped_column(Text, default="[]")      # JSON array of DeviceType values
     target_categories: Mapped[str] = mapped_column(Text, default="[]")   # IAB content categories
+    # Domain of the page the ad would appear on (OpenRTB `site.domain`).
+    # target_domains is contextual buying: empty means any domain.
+    # blocked_domains is brand safety: a veto, checked before anything else.
+    target_domains: Mapped[str] = mapped_column(
+        Text, default="[]", server_default="[]")
+    blocked_domains: Mapped[str] = mapped_column(
+        Text, default="[]", server_default="[]")
 
     start_date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     end_date: Mapped[datetime] = mapped_column(DateTime, nullable=True)
@@ -232,6 +239,17 @@ class AdSlot(Base):
 
     publisher: Mapped["Publisher"] = relationship("Publisher", back_populates="ad_slots")
     auction_results: Mapped[list["AuctionResult"]] = relationship("AuctionResult", back_populates="ad_slot")
+
+    @property
+    def publisher_domain(self) -> str:
+        """Domain of the publisher that owns this slot.
+
+        A bid request's page_url should be a page *on this domain* -- the slot
+        is inventory on that publisher's site. Exposing it lets a caller build
+        a coherent request instead of guessing a URL that matches nothing.
+        Requires the publisher relationship to be loaded.
+        """
+        return self.publisher.domain if self.publisher else ""
 
 
 # ─── BidRecord ────────────────────────────────────────────────────────────────

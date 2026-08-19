@@ -5,6 +5,18 @@ import { submitBidRequest } from '../api'
 const COUNTRIES = ['US', 'GB', 'NG', 'DE', 'CA', 'AU', 'FR', 'BR']
 const DEVICES = ['desktop', 'mobile', 'tablet']
 
+// Reason codes returned on the bid response. Naming them is the whole point:
+// a bidder count alone cannot tell you whether a rule fired or was ignored.
+const EXCLUSION_LABELS = {
+  country:        'Geo mismatch',
+  device:         'Device mismatch',
+  category:       'Category mismatch',
+  domain:         'Domain not targeted',
+  blocked_domain: 'Domain blocked',
+  creative:       'No creative for size',
+  floor:          'Could not clear floor',
+}
+
 export default function BidSimulator({ slots, onAuctionComplete }) {
   const [form, setForm] = useState({
     ad_slot_id: '',
@@ -54,10 +66,25 @@ export default function BidSimulator({ slots, onAuctionComplete }) {
         <div>
           <label style={labelStyle}>Ad Slot</label>
           <select style={inputStyle} value={form.ad_slot_id}
-            onChange={e => setForm(f => ({ ...f, ad_slot_id: e.target.value }))}>
+            onChange={e => {
+              const slot = slots.find(s => s.id === e.target.value)
+              // The page belongs to the publisher that owns the slot, so
+              // default to a URL on their domain. Still editable: overriding
+              // it is how you watch domain targeting bite.
+              setForm(f => ({
+                ...f,
+                ad_slot_id: e.target.value,
+                page_url: slot?.publisher_domain
+                  ? `https://${slot.publisher_domain}/article/sample`
+                  : f.page_url,
+              }))
+            }}>
             <option value="">Select a slot…</option>
             {slots.map(s => (
-              <option key={s.id} value={s.id}>{s.name} ({s.width}×{s.height})</option>
+              <option key={s.id} value={s.id}>
+                {s.name} ({s.width}×{s.height})
+                {s.publisher_domain ? ` — ${s.publisher_domain}` : ''}
+              </option>
             ))}
           </select>
         </div>
@@ -108,7 +135,7 @@ export default function BidSimulator({ slots, onAuctionComplete }) {
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 600, marginBottom: 12 }}>
               {result.had_fill
                 ? <><CheckCircle size={16} color="var(--green)" /> Auction filled</>
-                : <><XCircle size={16} color="var(--red)" /> No fill — no bids above floor</>}
+                : <><XCircle size={16} color="var(--red)" /> No fill — no campaign bid</>}
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
               {[
@@ -128,6 +155,31 @@ export default function BidSimulator({ slots, onAuctionComplete }) {
                 </div>
               ))}
             </div>
+
+            {result.excluded && Object.keys(result.excluded).length > 0 && (
+              <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid var(--border)' }}>
+                <div style={{ ...labelStyle, marginBottom: 8 }}>
+                  Why the others did not bid
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {Object.entries(result.excluded)
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([reason, count]) => (
+                      <span key={reason} style={{
+                        background: 'var(--surface)', border: '1px solid var(--border)',
+                        borderRadius: 999, padding: '3px 10px', fontSize: 12,
+                      }}>
+                        {EXCLUSION_LABELS[reason] || reason}
+                        <strong style={{ marginLeft: 6 }}>{count}</strong>
+                      </span>
+                  ))}
+                </div>
+                <div style={{ color: 'var(--muted)', fontSize: 11, marginTop: 8 }}>
+                  Campaigns out of budget or paused are filtered before the
+                  auction and are not counted here.
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>

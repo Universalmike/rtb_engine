@@ -32,6 +32,10 @@ class CampaignCreate(BaseModel):
     target_countries: list[str] = []
     target_devices: list[str] = []
     target_categories: list[str] = []
+    # Page domain (OpenRTB site.domain). Empty target_domains means any
+    # domain; blocked_domains vetoes regardless of everything else.
+    target_domains: list[str] = []
+    blocked_domains: list[str] = []
     start_date: datetime
     end_date: Optional[datetime] = None
 
@@ -81,6 +85,7 @@ class AdSlotCreate(BaseModel):
 class AdSlotOut(BaseModel):
     id: str
     publisher_id: str
+    publisher_domain: str = ""
     name: str
     width: int
     height: int
@@ -124,6 +129,11 @@ class BidResponse(BaseModel):
     charged_cost_micros: int = 0         # Exact charge for this impression
     highest_bid_cents: int
     num_bidders: int
+    # Why the campaigns that did not bid did not bid, keyed by rule name
+    # (country, device, category, domain, blocked_domain, creative, floor).
+    # Campaigns filtered in SQL on budget or status never reach the auction
+    # and are not counted here.
+    excluded: dict[str, int] = {}
     auction_type: AuctionType
     latency_ms: float                   # How long the auction took
     strategy: str = "control"           # which A/B arm ran this auction

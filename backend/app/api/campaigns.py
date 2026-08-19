@@ -17,6 +17,8 @@ async def create_campaign(payload: CampaignCreate, db: AsyncSession = Depends(ge
     data["target_countries"] = json.dumps(data["target_countries"])
     data["target_devices"] = json.dumps(data["target_devices"])
     data["target_categories"] = json.dumps(data["target_categories"])
+    data["target_domains"] = json.dumps(data["target_domains"])
+    data["blocked_domains"] = json.dumps(data["blocked_domains"])
     if data["value_per_click_millicents"] is None:
         data["value_per_click_millicents"] = round(
             data["max_cpm_cents"] / DEFAULT_BASELINE_CTR

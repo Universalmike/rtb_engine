@@ -22,6 +22,7 @@ import os
 import random
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlsplit
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import BigInteger, and_, case, cast, literal, or_, select, update
@@ -98,18 +99,23 @@ class AuctionEngine:
         start_time: float, mark,
     ) -> BidResponse:
         # 1. Fetch the ad slot
+        excluded: dict[str, int] = {}
+
         ad_slot = await self._get_ad_slot(bid_request.ad_slot_id)
         mark("fetch_slot")
         if not ad_slot:
-            return self._no_fill_response(auction_id, bid_request, start_time, "control")
+            return self._no_fill_response(
+                auction_id, bid_request, start_time, "control", excluded)
 
         # 2. Get eligible campaigns
-        eligible_campaigns = await self._get_eligible_campaigns(bid_request, ad_slot)
+        eligible_campaigns, excluded = await self._get_eligible_campaigns(
+            bid_request, ad_slot)
         mark("eligibility_query")
 
         if not eligible_campaigns:
             await self._save_no_fill_result(auction_id, ad_slot, start_time, "control")
-            return self._no_fill_response(auction_id, bid_request, start_time, "control")
+            return self._no_fill_response(
+                auction_id, bid_request, start_time, "control", excluded)
 
         # A/B: assign this auction to a bidding strategy and predict CTR once
         # (pCTR is a property of the impression context, identical across
@@ -124,12 +130,14 @@ class AuctionEngine:
         mark("predict_ctr")
 
         # 3. Collect bids under the assigned strategy
-        bids = self._collect_bids(eligible_campaigns, ad_slot, strategy, pctr)
+        bids = self._collect_bids(
+            eligible_campaigns, ad_slot, strategy, pctr, excluded)
         mark("collect_bids")
 
         if not bids:
             await self._save_no_fill_result(auction_id, ad_slot, start_time, strategy)
-            return self._no_fill_response(auction_id, bid_request, start_time, strategy)
+            return self._no_fill_response(
+                auction_id, bid_request, start_time, strategy, excluded)
 
         # 4. Run the winner's configured auction type and atomically reserve
         # the exact per-impression
@@ -152,7 +160,8 @@ class AuctionEngine:
 
         if result is None:
             await self._save_no_fill_result(auction_id, ad_slot, start_time, strategy)
-            return self._no_fill_response(auction_id, bid_request, start_time, strategy)
+            return self._no_fill_response(
+                auction_id, bid_request, start_time, strategy, excluded)
 
         winning_campaign = result["winner"]
         clearing_price = result["clearing_price_cents"]
@@ -197,6 +206,7 @@ class AuctionEngine:
             charged_cost_micros=charged_cost_micros,
             highest_bid_cents=result["highest_bid_cents"],
             num_bidders=len(bids),
+            excluded=excluded,
             auction_type=winning_campaign.auction_type,
             latency_ms=round(latency, 2),
             strategy=strategy,
@@ -214,22 +224,26 @@ class AuctionEngine:
 
     async def _get_eligible_campaigns(
         self, bid_request: BidRequest, ad_slot: AdSlot
-    ) -> list[Campaign]:
-        """
-        A campaign is eligible if:
-        - Status is ACTIVE
-        - Has remaining daily budget
-        - Bid floor is above the slot's floor price
+    ) -> tuple[list[Campaign], dict[str, int]]:
+        """Campaigns that may bid, and a count of why the rest may not.
+
+        Solvency, status and date filtering happen in SQL, so campaigns
+        rejected there are never seen here and are not counted. What is
+        counted is targeting, which is the part a visitor changing the bid
+        request can actually influence.
         """
         campaigns = await self._query_solvent_campaigns(ad_slot)
 
-        # Apply targeting filters
-        eligible = []
+        eligible: list[Campaign] = []
+        excluded: dict[str, int] = {}
         for c in campaigns:
-            if self._passes_targeting(c, bid_request, ad_slot):
+            reason = self._targeting_rejection(c, bid_request, ad_slot)
+            if reason is None:
                 eligible.append(c)
+            else:
+                excluded[reason] = excluded.get(reason, 0) + 1
 
-        return eligible
+        return eligible, excluded
 
     async def _query_solvent_campaigns(self, ad_slot: AdSlot) -> list[Campaign]:
         """Active campaigns with budget left that can clear the slot's floor.
@@ -290,32 +304,95 @@ class AuctionEngine:
     def _passes_targeting(
         self, campaign: Campaign, bid_request: BidRequest, ad_slot: AdSlot
     ) -> bool:
-        """
-        Check if a campaign's targeting rules match the bid request context.
-        Empty targeting list = no restriction (bid on everything).
+        """Whether every targeting rule this campaign sets matches the request."""
+        return self._targeting_rejection(campaign, bid_request, ad_slot) is None
+
+    def _targeting_rejection(
+        self, campaign: Campaign, bid_request: BidRequest, ad_slot: AdSlot
+    ) -> Optional[str]:
+        """Name of the first rule the request fails, or None if it passes.
+
+        The name is reported on the bid response. A visitor who changes the
+        page URL and watches the bidder count stay flat cannot otherwise tell
+        a rule that did not fire from a field being ignored, which this one
+        genuinely was until domain targeting existed.
+
+        Empty targeting list = no restriction. Malformed JSON is treated the
+        same way: bad data must not silently drop a campaign out of every
+        auction it would otherwise have contested.
         """
         try:
             target_countries = json.loads(campaign.target_countries)
             target_devices = json.loads(campaign.target_devices)
             target_categories = json.loads(campaign.target_categories)
+            target_domains = json.loads(campaign.target_domains or "[]")
+            blocked_domains = json.loads(campaign.blocked_domains or "[]")
 
             if target_countries and bid_request.country not in target_countries:
-                return False
+                return "country"
 
             if target_devices and bid_request.device_type.value not in target_devices:
-                return False
+                return "device"
 
             if target_categories and ad_slot.publisher.category not in target_categories:
-                return False
+                return "category"
+
+            if target_domains or blocked_domains:
+                domain = self._domain_of(bid_request.page_url)
+
+                # Brand safety is a veto: an advertiser that will not appear
+                # next to a domain does not appear there for any other reason.
+                if domain and self._domain_matches(domain, blocked_domains):
+                    return "blocked_domain"
+
+                # Contextual targeting that cannot be verified is not a match:
+                # a URL we could not read is not evidence of the right page.
+                if target_domains and not (
+                    domain and self._domain_matches(domain, target_domains)
+                ):
+                    return "domain"
 
         except (json.JSONDecodeError, AttributeError):
-            pass
+            return None
 
-        return True
+        return None
+
+    @staticmethod
+    def _domain_of(page_url: str) -> Optional[str]:
+        """Host of a page URL, or None when there isn't a usable one.
+
+        'www.' is dropped because no buyer means it, and the port is not part
+        of the domain. A bare 'example.com/x' is accepted as well as a full
+        URL, since publishers are inconsistent about sending the scheme.
+        """
+        try:
+            parts = urlsplit(page_url if "//" in page_url else f"//{page_url}")
+            host = (parts.hostname or "").lower()
+        except ValueError:
+            return None
+        if not host or "." not in host or " " in host:
+            return None
+        return host[4:] if host.startswith("www.") else host
+
+    @staticmethod
+    def _domain_matches(domain: str, entries) -> bool:
+        """Whether `domain` is, or sits under, any entry.
+
+        Buying 'example.com' buys 'sports.example.com' — a media buyer means
+        the publisher, not one hostname. The dot in the suffix test is what
+        stops 'example.com' from also matching 'notexample.com'.
+        """
+        for entry in entries or ():
+            entry = str(entry).strip().lower().lstrip(".")
+            if entry.startswith("www."):
+                entry = entry[4:]
+            if entry and (domain == entry or domain.endswith("." + entry)):
+                return True
+        return False
 
     def _collect_bids(
         self, campaigns: list[Campaign], ad_slot: AdSlot,
-        strategy: str, pctr: float,
+        strategy: str, pctr: float, excluded: Optional[dict] = None,
     ) -> list[dict]:
         """Each campaign submits a bid.
 
@@ -328,8 +405,10 @@ class AuctionEngine:
         Both are capped by remaining budget and must clear the slot floor.
         """
         bids = []
+        counts = excluded if excluded is not None else {}
         for campaign in campaigns:
             if self._pick_creative(campaign, ad_slot) is None:
+                counts["creative"] = counts.get("creative", 0) + 1
                 continue
             remaining_micros = min(
                 campaign.remaining_daily_budget_micros,
@@ -349,6 +428,10 @@ class AuctionEngine:
                 )
             if bid_amount >= ad_slot.floor_price_cents:
                 bids.append({"campaign": campaign, "bid_cents": bid_amount})
+            else:
+                # Wanted the impression but could not afford the floor, either
+                # from its own cap or from what is left of its budget.
+                counts["floor"] = counts.get("floor", 0) + 1
 
         return sorted(bids, key=lambda x: x["bid_cents"], reverse=True)
 
@@ -543,7 +626,9 @@ class AuctionEngine:
         self.db.add(result)
         await self.db.flush()
 
-    def _no_fill_response(self, auction_id, bid_request, start_time, strategy) -> BidResponse:
+    def _no_fill_response(
+        self, auction_id, bid_request, start_time, strategy, excluded=None
+    ) -> BidResponse:
         latency = (time.monotonic() - start_time) * 1000
         return BidResponse(
             auction_id=auction_id,
@@ -557,4 +642,5 @@ class AuctionEngine:
             auction_type=AuctionType.SECOND_PRICE,
             latency_ms=round(latency, 2),
             strategy=strategy,
+            excluded=excluded or {},
         )

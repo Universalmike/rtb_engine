@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import joinedload
 from app.core.database import get_db
 from app.models.models import Publisher, AdSlot
 from app.schemas.schemas import PublisherCreate, PublisherOut, AdSlotCreate, AdSlotOut
@@ -34,13 +35,21 @@ async def create_ad_slot(payload: AdSlotCreate, db: AsyncSession = Depends(get_d
 
 @router.get("/slots", response_model=list[AdSlotOut])
 async def list_ad_slots(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(AdSlot).where(AdSlot.is_active == True))
+    result = await db.execute(
+        select(AdSlot)
+        .where(AdSlot.is_active == True)
+        .options(joinedload(AdSlot.publisher))
+    )
     return result.scalars().all()
 
 
 @router.get("/slots/{slot_id}", response_model=AdSlotOut)
 async def get_ad_slot(slot_id: str, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(AdSlot).where(AdSlot.id == slot_id))
+    result = await db.execute(
+        select(AdSlot)
+        .where(AdSlot.id == slot_id)
+        .options(joinedload(AdSlot.publisher))
+    )
     slot = result.scalar_one_or_none()
     if not slot:
         raise HTTPException(status_code=404, detail="Ad slot not found")

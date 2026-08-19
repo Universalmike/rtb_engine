@@ -108,6 +108,7 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
         ("Mobile Interstitial 320x480", 320, 480, DeviceType.MOBILE, 18),
     ]
     slot_context = {}  # slot.id -> (publisher_category, banner_pos)
+    slot_domain = {}   # slot.id -> the owning publisher's domain
     for pub in publishers:
         for slot_name, w, h, device, floor in slot_configs:
             slot = AdSlot(
@@ -126,8 +127,10 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
             if slot.publisher_id == pub.id:
                 slot_context[slot.id] = (pub.category,
                                          SLOT_NAME_TO_BANNER_POS.get(slot.name, 0))
+                slot_domain[slot.id] = pub.domain
 
     # ── Campaigns ────────────────────────────────────────────────────────────
+    publisher_domains = [domain for _, domain, _ in publisher_data]
     campaigns = []
     for adv in advertisers:
         for i in range(random.randint(1, 3)):
@@ -146,6 +149,18 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
                 target_countries=json.dumps(random.sample(COUNTRIES, k=random.randint(1, 4))),
                 target_devices=json.dumps([d.value for d in random.sample(DEVICES, k=random.randint(1, 2))]),
                 target_categories=json.dumps(random.sample(CATEGORIES, k=2)),
+                # Roughly a third of campaigns buy specific publishers, and a
+                # quarter refuse one. Kept a minority on purpose: if most
+                # campaigns were domain-restricted the simulator would mostly
+                # no-fill, which teaches a visitor nothing.
+                target_domains=json.dumps(
+                    random.sample(publisher_domains, k=2)
+                    if random.random() < 0.33 else []
+                ),
+                blocked_domains=json.dumps(
+                    random.sample(publisher_domains, k=1)
+                    if random.random() < 0.25 else []
+                ),
                 start_date=datetime.utcnow() - timedelta(days=7),
                 end_date=datetime.utcnow() + timedelta(days=30),
             )
@@ -173,6 +188,8 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
             target_countries=json.dumps([]),
             target_devices=json.dumps([]),
             target_categories=json.dumps([]),
+            target_domains=json.dumps([]),
+            blocked_domains=json.dumps([]),
             start_date=datetime.utcnow() - timedelta(days=7),
             end_date=datetime.utcnow() + timedelta(days=30),
         )
@@ -212,7 +229,10 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
             ad_slot_id=slot.id,
             country=country,
             device_type=device,
-            page_url=f"https://{fake.domain_name()}/article/{fake.slug()}",
+            # The page belongs to the publisher that owns this slot. Using a
+            # random domain here made every simulated auction contextually
+            # meaningless, and domain targeting unobservable in the data.
+            page_url=f"https://{slot_domain[slot.id]}/article/{fake.slug()}",
             user_agent=fake.user_agent(),
         )
         try:
