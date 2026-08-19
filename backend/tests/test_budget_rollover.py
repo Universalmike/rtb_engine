@@ -81,6 +81,9 @@ class RecordingSession:
         rows, returning_row = self.rows, self.returning_row
 
         class Result:
+            def unique(self):
+                return self
+
             def scalars(self):
                 return SimpleNamespace(all=lambda: rows)
 
