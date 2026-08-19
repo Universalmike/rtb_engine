@@ -134,6 +134,12 @@ class BidResponse(BaseModel):
     # Campaigns filtered in SQL on budget or status never reach the auction
     # and are not counted here.
     excluded: dict[str, int] = {}
+    # Content category inferred for this page, and which signal produced it:
+    # section (a /sport/ style path), known_domain, keyword, publisher (the
+    # URL said nothing, so the site's own category was used), or unknown.
+    # Category targeting matches against this, not the publisher's category.
+    page_category: Optional[str] = None
+    page_category_source: str = "unknown"
     auction_type: AuctionType
     latency_ms: float                   # How long the auction took
     strategy: str = "control"           # which A/B arm ran this auction

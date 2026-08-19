@@ -150,7 +150,7 @@ auction.
 |-------|-----------------|-----------|
 | `target_countries` | `country` | allow list |
 | `target_devices` | `device_type` | allow list |
-| `target_categories` | the publisher's category | allow list |
+| `target_categories` | the page's content category | allow list — see below |
 | `target_domains` | domain of `page_url` | allow list — contextual buying |
 | `blocked_domains` | domain of `page_url` | block list — brand safety |
 
@@ -168,6 +168,45 @@ things follow from how buyers actually think about it:
 Contextual targeting that cannot be verified is not treated as a match: if the
 URL has no readable domain, a campaign with a `target_domains` list does not
 bid, while one that only blocks is unaffected.
+
+### Contextual classification
+
+An allow list can only match domains somebody enumerated in advance, so on its
+own it makes every unlisted domain behave identically. Real RTB solves this
+with categories: the advertiser buys a category and the exchange says what the
+page is (OpenRTB's `site.cat` alongside `site.page`).
+
+So `page_url` is classified into one of the six content categories campaigns
+already target, and `target_categories` matches **that** rather than the
+publisher's own category — a page is what an advertiser is buying, and
+publishers have sections. Four signals, most confident first:
+
+| Source | Example | Result |
+|--------|---------|--------|
+| `section` | `bbc.com/sport/football` | `sports` — a section beats the masthead |
+| `known_domain` | `espn.com`, `vogue.com` | `sports`, `fashion` |
+| `keyword` | `nigeriasportsdaily.com` | `sports` — inferred from the name |
+| `publisher` | `randomblog.xyz` | the publisher's own category, unchanged |
+
+Both the category and the signal that produced it come back on the response,
+so an inference is never invisible:
+
+```json
+"page_category": "sports",
+"page_category_source": "section"
+```
+
+Only the first path segment counts as a section, or
+`techcrunch.com/2024/01/money-raised` would read as finance. Leading words beat
+buried ones, which is what separates `newsportal.co` (news) from
+`sportsdailynews.com` (sports) — a plain substring scan gets that pair
+backwards.
+
+This is a heuristic over the URL, not a crawler. Fetching an arbitrary page
+mid-auction would cost more than the entire latency budget and would have the
+auction issuing requests to caller-supplied addresses. A URL that classifies
+to nothing — `google.com` is a search engine, not a content category — returns
+`unknown` and falls back to the publisher, rather than inventing an answer.
 
 ### Why a campaign did not bid
 

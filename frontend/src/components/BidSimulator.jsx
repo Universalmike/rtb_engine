@@ -17,6 +17,16 @@ const EXCLUSION_LABELS = {
   floor:          'Could not clear floor',
 }
 
+// How the page's content category was arrived at. Shown because an inferred
+// category that cannot be seen is indistinguishable from a guess.
+const CATEGORY_SOURCE_LABELS = {
+  section:      'from URL section',
+  known_domain: 'known site',
+  keyword:      'inferred from name',
+  publisher:    "publisher's own",
+  unknown:      'not recognised',
+}
+
 export default function BidSimulator({ slots, onAuctionComplete }) {
   const [form, setForm] = useState({
     ad_slot_id: '',
@@ -110,6 +120,11 @@ export default function BidSimulator({ slots, onAuctionComplete }) {
           <label style={labelStyle}>Page URL</label>
           <input style={inputStyle} value={form.page_url}
             onChange={e => setForm(f => ({ ...f, page_url: e.target.value }))} />
+          <div style={{ color: 'var(--muted)', fontSize: 11, marginTop: 4 }}>
+            Any real site works — try espn.com, bloomberg.com, vogue.com or
+            bbc.com/sport. The domain sets the page category that campaigns
+            target.
+          </div>
         </div>
 
         <button onClick={handleSubmit} disabled={loading} style={{
@@ -145,6 +160,9 @@ export default function BidSimulator({ slots, onAuctionComplete }) {
                 ['Impression cost', result.charged_cost_micros > 0
                   ? `$${(result.charged_cost_micros / 1_000_000).toFixed(6)}`
                   : '$0.000000'],
+                ['Page category', result.page_category
+                  ? `${result.page_category} · ${CATEGORY_SOURCE_LABELS[result.page_category_source] || result.page_category_source}`
+                  : '—'],
                 ['Latency', `${result.latency_ms}ms`],
                 ['Auction type', result.auction_type?.replace('_', ' ')],
                 ['Auction ID', result.auction_id.slice(0, 8) + '…'],

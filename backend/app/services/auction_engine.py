@@ -22,7 +22,6 @@ import os
 import random
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import urlsplit
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import BigInteger, and_, case, cast, literal, or_, select, update
@@ -35,6 +34,7 @@ from app.models.models import (
 from app.schemas.schemas import BidRequest, BidResponse, AuctionType
 from app.core.redis_client import get_redis, IMPRESSION_STREAM
 from app.ml.predictor import predict_ctr
+from app.services.contextual import classify_url, domain_of
 logger = logging.getLogger(__name__)
 
 # Phase timings are always logged; set AUCTION_PROFILE=1 to also return them on
@@ -104,18 +104,24 @@ class AuctionEngine:
         ad_slot = await self._get_ad_slot(bid_request.ad_slot_id)
         mark("fetch_slot")
         if not ad_slot:
+            category, category_source = self._context_category(bid_request, None)
             return self._no_fill_response(
-                auction_id, bid_request, start_time, "control", excluded)
+                auction_id, bid_request, start_time, "control", excluded,
+                category, category_source)
 
         # 2. Get eligible campaigns
+        # Classified once per auction: the page is a property of the request,
+        # not of any campaign looking at it.
+        category, category_source = self._context_category(bid_request, ad_slot)
         eligible_campaigns, excluded = await self._get_eligible_campaigns(
-            bid_request, ad_slot)
+            bid_request, ad_slot, category)
         mark("eligibility_query")
 
         if not eligible_campaigns:
             await self._save_no_fill_result(auction_id, ad_slot, start_time, "control")
             return self._no_fill_response(
-                auction_id, bid_request, start_time, "control", excluded)
+                auction_id, bid_request, start_time, "control", excluded,
+                category, category_source)
 
         # A/B: assign this auction to a bidding strategy and predict CTR once
         # (pCTR is a property of the impression context, identical across
@@ -137,7 +143,8 @@ class AuctionEngine:
         if not bids:
             await self._save_no_fill_result(auction_id, ad_slot, start_time, strategy)
             return self._no_fill_response(
-                auction_id, bid_request, start_time, strategy, excluded)
+                auction_id, bid_request, start_time, strategy, excluded,
+                category, category_source)
 
         # 4. Run the winner's configured auction type and atomically reserve
         # the exact per-impression
@@ -161,7 +168,8 @@ class AuctionEngine:
         if result is None:
             await self._save_no_fill_result(auction_id, ad_slot, start_time, strategy)
             return self._no_fill_response(
-                auction_id, bid_request, start_time, strategy, excluded)
+                auction_id, bid_request, start_time, strategy, excluded,
+                category, category_source)
 
         winning_campaign = result["winner"]
         clearing_price = result["clearing_price_cents"]
@@ -207,6 +215,8 @@ class AuctionEngine:
             highest_bid_cents=result["highest_bid_cents"],
             num_bidders=len(bids),
             excluded=excluded,
+            page_category=category,
+            page_category_source=category_source,
             auction_type=winning_campaign.auction_type,
             latency_ms=round(latency, 2),
             strategy=strategy,
@@ -223,7 +233,8 @@ class AuctionEngine:
         return result.scalar_one_or_none()
 
     async def _get_eligible_campaigns(
-        self, bid_request: BidRequest, ad_slot: AdSlot
+        self, bid_request: BidRequest, ad_slot: AdSlot,
+        page_category: Optional[str] = None,
     ) -> tuple[list[Campaign], dict[str, int]]:
         """Campaigns that may bid, and a count of why the rest may not.
 
@@ -233,11 +244,14 @@ class AuctionEngine:
         request can actually influence.
         """
         campaigns = await self._query_solvent_campaigns(ad_slot)
+        if page_category is None:
+            page_category, _ = self._context_category(bid_request, ad_slot)
 
         eligible: list[Campaign] = []
         excluded: dict[str, int] = {}
         for c in campaigns:
-            reason = self._targeting_rejection(c, bid_request, ad_slot)
+            reason = self._targeting_rejection(
+                c, bid_request, ad_slot, page_category)
             if reason is None:
                 eligible.append(c)
             else:
@@ -301,6 +315,20 @@ class AuctionEngine:
             else_=literal(0, type_=BigInteger),
         )
 
+    def _context_category(self, bid_request: BidRequest, ad_slot: AdSlot):
+        """The content category this impression is sold against, and its source.
+
+        The page wins over the publisher when it can be classified: a page is
+        what an advertiser is buying, and publishers have sections. Falling
+        back to the publisher's own category is the previous behaviour, so a
+        URL that classifies to nothing changes nothing.
+        """
+        category, source = classify_url(bid_request.page_url or "")
+        if category:
+            return category, source
+        publisher = ad_slot.publisher if ad_slot is not None else None
+        return (publisher.category if publisher else None), "publisher"
+
     def _passes_targeting(
         self, campaign: Campaign, bid_request: BidRequest, ad_slot: AdSlot
     ) -> bool:
@@ -308,7 +336,8 @@ class AuctionEngine:
         return self._targeting_rejection(campaign, bid_request, ad_slot) is None
 
     def _targeting_rejection(
-        self, campaign: Campaign, bid_request: BidRequest, ad_slot: AdSlot
+        self, campaign: Campaign, bid_request: BidRequest, ad_slot: AdSlot,
+        page_category: Optional[str] = None,
     ) -> Optional[str]:
         """Name of the first rule the request fails, or None if it passes.
 
@@ -321,6 +350,9 @@ class AuctionEngine:
         same way: bad data must not silently drop a campaign out of every
         auction it would otherwise have contested.
         """
+        if page_category is None:
+            page_category, _ = self._context_category(bid_request, ad_slot)
+
         try:
             target_countries = json.loads(campaign.target_countries)
             target_devices = json.loads(campaign.target_devices)
@@ -334,7 +366,7 @@ class AuctionEngine:
             if target_devices and bid_request.device_type.value not in target_devices:
                 return "device"
 
-            if target_categories and ad_slot.publisher.category not in target_categories:
+            if target_categories and page_category not in target_categories:
                 return "category"
 
             if target_domains or blocked_domains:
@@ -357,22 +389,7 @@ class AuctionEngine:
 
         return None
 
-    @staticmethod
-    def _domain_of(page_url: str) -> Optional[str]:
-        """Host of a page URL, or None when there isn't a usable one.
-
-        'www.' is dropped because no buyer means it, and the port is not part
-        of the domain. A bare 'example.com/x' is accepted as well as a full
-        URL, since publishers are inconsistent about sending the scheme.
-        """
-        try:
-            parts = urlsplit(page_url if "//" in page_url else f"//{page_url}")
-            host = (parts.hostname or "").lower()
-        except ValueError:
-            return None
-        if not host or "." not in host or " " in host:
-            return None
-        return host[4:] if host.startswith("www.") else host
+    _domain_of = staticmethod(domain_of)
 
     @staticmethod
     def _domain_matches(domain: str, entries) -> bool:
@@ -627,7 +644,8 @@ class AuctionEngine:
         await self.db.flush()
 
     def _no_fill_response(
-        self, auction_id, bid_request, start_time, strategy, excluded=None
+        self, auction_id, bid_request, start_time, strategy, excluded=None,
+        page_category=None, page_category_source="unknown",
     ) -> BidResponse:
         latency = (time.monotonic() - start_time) * 1000
         return BidResponse(
@@ -643,4 +661,6 @@ class AuctionEngine:
             latency_ms=round(latency, 2),
             strategy=strategy,
             excluded=excluded or {},
+            page_category=page_category,
+            page_category_source=page_category_source,
         )
