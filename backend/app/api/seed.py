@@ -194,7 +194,11 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
             target_domains=json.dumps([]),
             blocked_domains=json.dumps([]),
             start_date=datetime.utcnow() - timedelta(days=7),
-            end_date=datetime.utcnow() + timedelta(days=30),
+            # Open-ended. With a fixed flight every campaign ended together,
+            # five weeks after the last seed, and the live demo silently
+            # stopped filling until someone reseeded. Targeted campaigns keep
+            # their realistic flights; these are what keeps the lights on.
+            end_date=None,
         )
         db.add(ron)
         campaigns.append(ron)

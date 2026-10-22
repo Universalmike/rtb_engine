@@ -161,6 +161,27 @@ def test_one_session_serves_auctions_on_slots_of_different_sizes():
         [r.excluded for r in results]
 
 
+def test_an_open_ended_campaign_keeps_bidding_after_dated_ones_end():
+    """Run-of-network campaigns carry no end date so the demo cannot go dark."""
+    async def scenario(sessions):
+        slot_id = await seed(sessions, campaigns=2)
+        async with sessions() as s:
+            ended, open_ended = (await s.execute(
+                select(Campaign).order_by(Campaign.max_cpm_cents.desc())
+            )).scalars().all()
+            ended.end_date = datetime.utcnow() - timedelta(days=1)
+            open_ended.end_date = None
+            await s.flush()
+            open_ended_id = open_ended.id
+        response = await auction(sessions, slot_id)
+        return response, open_ended_id
+
+    response, open_ended_id = run(scenario)
+    assert response.had_fill
+    assert response.num_bidders == 1
+    assert response.winning_campaign_id == open_ended_id
+
+
 def test_a_refused_charge_writes_nothing():
     """The race the retry loop handles: budget gone between read and charge."""
     async def scenario(sessions):
