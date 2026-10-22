@@ -283,8 +283,8 @@ hosted database:
 Every run was also audited row by row: spend equals the sum of impression
 charges, no budget is exceeded, each filled auction has one impression and
 one bid record per bidder, clearing prices follow the second-price rule, and
-each filled auction produced exactly one Redis event. These are local
-figures; the deployed stack has not been re-measured since.
+each filled auction produced exactly one Redis event. On the deployed stack
+it measures 27ms p50 server-side; see Deployment below.
 
 ## Data Model
 
@@ -303,13 +303,17 @@ The backend runs on **Render** (a long-lived container) and the frontend on
 
 ### Backend — Render
 
-`render.yaml` provisions a web service in the **Oregon** region so it sits next to
-the Supabase database (`us-west-2`). Colocation matters: an auction makes two
-sequential database round trips, and a cross-region hop multiplies both of
-them.
+`render.yaml` provisions a web service in the **Frankfurt** region so it sits
+next to the Supabase database (`eu-central-1`). Colocation matters more than
+anything in the code: an auction makes two sequential database round trips,
+and through Supabase's pooler each statement is a prepare plus an execute.
+With the backend in Frankfurt and the database in Oregon, the same code
+measured 1.3s per auction.
 
-Before the round-trip work above, a warm auction measured ~150ms end-to-end on
-the deployed stack, nearly all of it waiting on Postgres. The connection pool
+Measured on the deployed stack (Render Frankfurt, Supabase `eu-central-1`),
+100 warm auctions: **27ms p50 / 54ms p95 server-side**, split evenly between
+the eligibility read and the charge-and-record write. Before the round-trip
+work above it was ~150ms. The connection pool
 is warmed at boot so connection setup is paid once rather than inside the first
 visitor's auction. Free-tier containers still spin down when idle, and a cold
 start adds several seconds on top of that.
@@ -322,7 +326,7 @@ response; it is always written to the logs regardless.
 | Root Directory | `backend` |
 | Build | `pip install -r requirements.txt` |
 | Start | `uvicorn app.main:app --host 0.0.0.0 --port $PORT` |
-| Region | `oregon` — match your database's region |
+| Region | `frankfurt` — must match your database's region |
 
 Environment variables:
 

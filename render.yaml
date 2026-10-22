@@ -3,7 +3,7 @@ services:
   - type: web
     name: rtb-engine-api
     runtime: python
-    region: oregon
+    region: frankfurt     # same region as the Supabase project (eu-central-1)
     plan: free
     rootDir: backend
     buildCommand: pip install -r requirements.txt
