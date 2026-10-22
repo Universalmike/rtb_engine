@@ -10,6 +10,22 @@ jobs:
     defaults:
       run:
         working-directory: backend
+    # The auction's write is one SQL statement whose types and CTE semantics
+    # only Postgres can confirm, so the suite runs against a real one.
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: rtb
+          POSTGRES_PASSWORD: rtb_secret
+          POSTGRES_DB: rtb_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rtb -d rtb_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://rtb:rtb_secret@localhost:5432/rtb_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
