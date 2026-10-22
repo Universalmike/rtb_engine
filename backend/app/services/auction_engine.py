@@ -6,14 +6,15 @@ How a real auction works (simplified):
 2. Engine fetches all eligible campaigns (active, budget available, targeting match)
 3. Each campaign submits a bid (their max CPM)
 4. Second-price auction: winner pays 2nd highest bid + 1 cent (Vickrey auction)
-5. Result is stored, impression event is fired to Redis Stream
-6. Budget is decremented on the winning campaign
+5. Budget is charged and the result stored, in one atomic statement
+6. Impression event is fired to Redis Stream, after the write has landed
 
 Second-price auction theory: bidders are incentivized to bid their true value
 because they never pay more than the second-highest bid. This is the same
 mechanism used by Google Ad Exchange, AppNexus, and most major DSPs.
 """
 
+import asyncio
 import uuid
 import time
 import json
@@ -24,12 +25,17 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import BigInteger, and_, case, cast, literal, or_, select, update
+from sqlalchemy import (
+    BigInteger, Boolean, Integer, String, and_, case, cast, column, func,
+    insert, literal, or_, select, true, update,
+)
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import joinedload
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.models.models import (
     Advertiser, Campaign, CampaignStatus, AdSlot, AdCreative,
-    BidRecord, AuctionResult, Impression,
+    BidRecord, AuctionResult, Impression, gen_uuid,
 )
 from app.schemas.schemas import BidRequest, BidResponse, AuctionType
 from app.core.redis_client import get_redis, IMPRESSION_STREAM
@@ -47,23 +53,47 @@ from app.services.accounting import (
     max_affordable_cpm_cents,
 )
 
+# Ad slots, with their publisher, keyed by id. A slot's size, floor and
+# category are inventory configuration: they change when someone edits the
+# site, not between one page view and the next, yet fetching them was a full
+# database round trip on every bid request. Bounded staleness is the price;
+# writes made through this process clear the cache immediately.
+SLOT_CACHE_TTL_SECONDS = float(os.getenv("SLOT_CACHE_TTL_SECONDS", "30"))
+_slot_cache: dict[str, tuple[float, AdSlot]] = {}
+
+
+def clear_slot_cache() -> None:
+    """Forget every cached slot. Call after anything that changes inventory."""
+    _slot_cache.clear()
+
+
+# Strong references to in-flight event publishes; the event loop only keeps
+# weak ones, and a task collected mid-flight is silently dropped.
+_background_tasks: set[asyncio.Task] = set()
+
+
 class AuctionEngine:
 
     def __init__(self, db: AsyncSession):
         self.db = db
         self.redis = get_redis()
+        # Impression events from auctions this engine has run, held until
+        # publish_events() so nothing is announced before its write commits.
+        self.pending_events: list[dict] = []
 
     async def run_auction(self, bid_request: BidRequest) -> BidResponse:
         """Main auction flow, wrapped in per-phase timing.
 
-        This path is I/O bound, not compute bound. A warm auction on the
-        deployed stack measures ~150ms end-to-end, of which ~0.1ms is compute;
-        the rest is four sequential database round trips. The per-phase
-        breakdown exists to keep that visible: each entry is the ms spent
-        between two steps, so one slow trip shows up instead of being buried
-        in a single total.
+        This path is I/O bound, not compute bound: a warm auction is two
+        sequential database round trips, the eligibility read and the
+        charge-and-record write. The per-phase breakdown exists to keep that
+        visible: each entry is the ms spent between two steps, so one slow
+        trip shows up instead of being buried in a single total.
+
+        perf_counter, not monotonic: on Windows monotonic ticks every 15.6ms,
+        which reported every phase as either 0 or 15.6.
         """
-        start_time = time.monotonic()
+        start_time = time.perf_counter()
         auction_id = str(uuid.uuid4())
         phases: dict[str, float] = {}
         mark = self._phase_marker(phases)
@@ -75,7 +105,7 @@ class AuctionEngine:
         finally:
             logger.info(
                 "auction=%s total_ms=%.2f phases_ms=%s",
-                auction_id, (time.monotonic() - start_time) * 1000, phases,
+                auction_id, (time.perf_counter() - start_time) * 1000, phases,
             )
 
         if PROFILE_AUCTIONS:
@@ -85,10 +115,10 @@ class AuctionEngine:
     @staticmethod
     def _phase_marker(phases: dict):
         """Returns mark(name): records ms elapsed since the previous mark."""
-        previous = [time.monotonic()]
+        previous = [time.perf_counter()]
 
         def mark(name: str) -> None:
-            now = time.monotonic()
+            now = time.perf_counter()
             phases[name] = round((now - previous[0]) * 1000, 2)
             previous[0] = now
 
@@ -146,24 +176,33 @@ class AuctionEngine:
                 auction_id, bid_request, start_time, strategy, excluded,
                 category, category_source)
 
-        # 4. Run the winner's configured auction type and atomically reserve
-        # the exact per-impression
-        # charge. A concurrent auction may spend a candidate's last budget
-        # after eligibility was read; in that case remove it and rerun.
+        # 4. Run the winner's configured auction type, then charge it and
+        # record the auction in one statement: the budget reservation, the
+        # auction result, every bid record and the impression either all land
+        # or none do. A concurrent auction may spend a candidate's last budget
+        # after eligibility was read; then nothing is written, the candidate
+        # is removed, and the auction reruns.
         result = None
         charged_cost_micros = 0
+        creative = None
         while bids:
             candidate_result = self._run_price_auction(bids, ad_slot)
             candidate = candidate_result["winner"]
             candidate_cost = cpm_cents_to_impression_micros(
                 candidate_result["clearing_price_cents"]
             )
-            if await self._reserve_budget(candidate, candidate_cost):
+            candidate_creative = self._pick_creative(candidate, ad_slot)
+            records = self._auction_records(
+                auction_id, ad_slot, bid_request, bids, candidate_result,
+                candidate_creative, candidate_cost, strategy,
+            )
+            if await self._reserve_budget(candidate, candidate_cost, records):
                 result = candidate_result
                 charged_cost_micros = candidate_cost
+                creative = candidate_creative
                 break
             bids = [bid for bid in bids if bid["campaign"].id != candidate.id]
-        mark("reserve_budget")
+        mark("reserve_and_record")
 
         if result is None:
             await self._save_no_fill_result(auction_id, ad_slot, start_time, strategy)
@@ -174,35 +213,15 @@ class AuctionEngine:
         winning_campaign = result["winner"]
         clearing_price = result["clearing_price_cents"]
 
-        # 5. Pick a creative from the winning campaign
-        creative = self._pick_creative(winning_campaign, ad_slot)
-
-        # 6. Save bid records (all bids, win/lose)
-        await self._save_bid_records(auction_id, bids)
-        mark("save_bid_records")
-
-        # 7. Save auction result
-        await self._save_auction_result(
-            auction_id, ad_slot, winning_campaign, creative,
-            result["highest_bid_cents"], clearing_price, charged_cost_micros,
-            len(bids), strategy
-        )
-        mark("save_auction_result")
-
-        # 8. Save the impression and emit its event.
-        await self._emit_impression_event(
+        # 5. Queue the impression event. The caller publishes it once the
+        # write is durable; announcing an impression that a failed commit
+        # then erased would have consumers bill for an ad nobody bought.
+        self._queue_impression_event(
             auction_id, winning_campaign, ad_slot, clearing_price,
-            charged_cost_micros, bid_request
+            charged_cost_micros, bid_request,
         )
-        mark("emit_impression")
 
-        # Bid records, auction result and impression were queued, not written.
-        # One flush sends them together: three round trips become one. It stays
-        # inside the timed section so latency_ms keeps reporting real work.
-        await self.db.flush()
-        mark("persist")
-
-        latency = (time.monotonic() - start_time) * 1000
+        latency = (time.perf_counter() - start_time) * 1000
 
         return BidResponse(
             auction_id=auction_id,
@@ -225,12 +244,32 @@ class AuctionEngine:
     # ─── Private helpers ──────────────────────────────────────────────────────
 
     async def _get_ad_slot(self, slot_id: str) -> Optional[AdSlot]:
+        """The active slot with its publisher, from cache when fresh.
+
+        Only hits are cached. An unknown id is cheap to look up again, and
+        caching the miss would hide a slot created a moment later.
+        """
+        now = time.monotonic()
+        cached = _slot_cache.get(slot_id)
+        if cached and cached[0] > now:
+            return cached[1]
+
         result = await self.db.execute(
             select(AdSlot)
             .where(AdSlot.id == slot_id, AdSlot.is_active == True)
             .options(joinedload(AdSlot.publisher))
         )
-        return result.scalar_one_or_none()
+        slot = result.scalar_one_or_none()
+        if slot is not None and SLOT_CACHE_TTL_SECONDS > 0:
+            # Detach before sharing. A rollback expires everything still in
+            # its session, and an expired attribute on a cached object would
+            # fail to load in whichever later request touched it next.
+            # Expunge does not cascade to the publisher, so it goes too.
+            if slot.publisher is not None:
+                self.db.expunge(slot.publisher)
+            self.db.expunge(slot)
+            _slot_cache[slot_id] = (now + SLOT_CACHE_TTL_SECONDS, slot)
+        return slot
 
     async def _get_eligible_campaigns(
         self, bid_request: BidRequest, ad_slot: AdSlot,
@@ -295,7 +334,23 @@ class AuctionEngine:
                     Campaign.max_cpm_cents >= ad_slot.floor_price_cents,
                 )
             )
-            .options(joinedload(Campaign.creatives))
+            # Only creatives that could serve this slot. Loading all of them
+            # returned every campaign once per creative of every size, and
+            # building ORM objects for rows _pick_creative then discards was
+            # the single largest CPU cost of an auction. It is an outer join,
+            # so a campaign with no fitting creative still comes back, with
+            # an empty list, and is still counted under "creative".
+            .options(joinedload(Campaign.creatives.and_(
+                AdCreative.is_active == True,
+                AdCreative.width == ad_slot.width,
+                AdCreative.height == ad_slot.height,
+            )))
+            # A session that already holds a campaign keeps its loaded state
+            # by default: here, a creatives list filtered for whichever slot
+            # size was asked about first, and the spend as of then. The
+            # seeder runs every auction through one session, and without
+            # this its fill rate fell from ~96% to ~18%.
+            .execution_options(populate_existing=True)
         )
         # joinedload on a collection repeats the parent row per child, so the
         # identity map has to de-duplicate before we materialise the list.
@@ -496,36 +551,97 @@ class AuctionEngine:
                 return creative
         return None
 
-    async def _save_bid_records(self, auction_id: str, bids: list[dict]):
-        for i, bid in enumerate(bids):
-            record = BidRecord(
-                auction_id=auction_id,
-                campaign_id=bid["campaign"].id,
-                bid_price_cents=bid["bid_cents"],
-                is_winner=(i == 0),
-            )
-            self.db.add(record)
+    def _auction_records(
+        self, auction_id: str, ad_slot: AdSlot, bid_request: BidRequest,
+        bids: list[dict], result: dict, creative: Optional[AdCreative],
+        charged_cost_micros: int, strategy: str,
+    ) -> list:
+        """INSERTs recording a filled auction, to ride along with its charge.
 
-    async def _save_auction_result(
-        self, auction_id, ad_slot, winning_campaign,
-        creative, highest_bid, clearing_price, charged_cost_micros,
-        num_bidders, strategy
-    ):
-        result = AuctionResult(
-            auction_id=auction_id,
-            ad_slot_id=ad_slot.id,
-            winning_campaign_id=winning_campaign.id,
-            winning_creative_id=creative.id if creative else None,
-            highest_bid_cents=highest_bid,
-            clearing_price_cents=clearing_price,
-            charged_cost_micros=charged_cost_micros,
-            num_bidders=num_bidders,
-            had_fill=True,
-            strategy=strategy,
-        )
-        self.db.add(result)
+        Each is a builder taking the reservation CTE and returning an INSERT
+        CTE that selects from it. A reservation that matches no row yields no
+        rows to insert, so the auction is recorded exactly when it is paid
+        for. Every value is typed explicitly: an untyped parameter in an
+        INSERT ... SELECT has no target column to infer its type from.
+        """
+        now = datetime.utcnow()
+        winner = result["winner"]
 
-    async def _reserve_budget(self, campaign: Campaign, charge_micros: int) -> bool:
+        def typed(col, value):
+            return literal(value, type_=col.type)
+
+        def auction_result(reserved):
+            row = {
+                AuctionResult.id: gen_uuid(),
+                AuctionResult.auction_id: auction_id,
+                AuctionResult.ad_slot_id: ad_slot.id,
+                AuctionResult.winning_campaign_id: winner.id,
+                AuctionResult.winning_creative_id: creative.id if creative else None,
+                AuctionResult.highest_bid_cents: result["highest_bid_cents"],
+                AuctionResult.clearing_price_cents: result["clearing_price_cents"],
+                AuctionResult.charged_cost_micros: charged_cost_micros,
+                AuctionResult.num_bidders: len(bids),
+                AuctionResult.strategy: strategy,
+                AuctionResult.had_fill: True,
+                AuctionResult.created_at: now,
+            }
+            return insert(AuctionResult).from_select(
+                [c.key for c in row],
+                select(*(typed(c, v) for c, v in row.items())).select_from(reserved),
+            ).cte("recorded_result")
+
+        def impression(reserved):
+            row = {
+                Impression.id: gen_uuid(),
+                Impression.auction_id: auction_id,
+                Impression.campaign_id: winner.id,
+                Impression.ad_slot_id: ad_slot.id,
+                Impression.clearing_price_cents: result["clearing_price_cents"],
+                Impression.charged_cost_micros: charged_cost_micros,
+                Impression.country: bid_request.country,
+                Impression.device_type: bid_request.device_type.value,
+                Impression.created_at: now,
+            }
+            return insert(Impression).from_select(
+                [c.key for c in row],
+                select(*(typed(c, v) for c, v in row.items())).select_from(reserved),
+            ).cte("recorded_impression")
+
+        def bid_records(reserved):
+            # Every bid, win or lose: the audit trail for billing disputes.
+            # Passed as one array per column and unnested, not as a VALUES
+            # list: the SQL text then stays the same whatever the bid count,
+            # so it is compiled and prepared once. A VALUES list is a new
+            # statement for every bidder count and opts out of SQLAlchemy's
+            # compiled cache entirely, which cost more than the database did.
+            submitted = func.unnest(
+                literal([gen_uuid() for _ in bids], ARRAY(String)),
+                literal([bid["campaign"].id for bid in bids], ARRAY(String)),
+                literal([bid["bid_cents"] for bid in bids], ARRAY(Integer)),
+                literal([i == 0 for i in range(len(bids))], ARRAY(Boolean)),
+            ).table_valued(
+                column("id", String), column("campaign_id", String),
+                column("bid_price_cents", Integer), column("is_winner", Boolean),
+                name="submitted",
+            ).render_derived()
+            return insert(BidRecord).from_select(
+                ["id", "auction_id", "campaign_id", "bid_price_cents",
+                 "is_winner", "created_at"],
+                select(
+                    submitted.c.id,
+                    typed(BidRecord.auction_id, auction_id),
+                    submitted.c.campaign_id,
+                    submitted.c.bid_price_cents,
+                    submitted.c.is_winner,
+                    typed(BidRecord.created_at, now),
+                ).select_from(submitted.join(reserved, true())),
+            ).cte("recorded_bids")
+
+        return [auction_result, impression, bid_records]
+
+    async def _reserve_budget(
+        self, campaign: Campaign, charge_micros: int, records=(),
+    ) -> bool:
         """Atomically reserve spend without crossing daily or lifetime limits.
 
         This single UPDATE also performs the campaign's daily rollover: when
@@ -533,6 +649,14 @@ class AuctionEngine:
         stamped with today's date as it is charged. Keeping the reset in the
         same conditional UPDATE makes it atomic per row, so concurrent
         auctions cannot race it into double-spending.
+
+        `records` (see _auction_records) are written in the same statement,
+        as data-modifying CTEs reading from the reservation. One statement is
+        one round trip, is atomic without an explicit transaction, and holds
+        the campaign's row lock only while it executes. Charging first and
+        inserting afterwards held that lock across every later round trip up
+        to COMMIT, so concurrent auctions won by the same campaign queued
+        behind each other.
         """
         today = datetime.now(timezone.utc).date()
         spent_today = self._spent_today_expression(today)
@@ -545,7 +669,7 @@ class AuctionEngine:
             cast(Campaign.total_budget_cents, BigInteger) * MICROS_PER_CENT
         )
 
-        reservation = await self.db.execute(
+        reservation = (
             update(Campaign)
             .where(
                 Campaign.id == campaign.id,
@@ -581,53 +705,76 @@ class AuctionEngine:
                 Campaign.total_spent_micros,
                 Campaign.status,
             )
-            .execution_options(synchronize_session=False)
         )
-        row = reservation.one_or_none()
+
+        if records:
+            reserved = reservation.cte("reserved")
+            statement = select(
+                reserved.c.spent_today_micros,
+                reserved.c.total_spent_micros,
+                reserved.c.status,
+            ).add_cte(*(build(reserved) for build in records))
+        else:
+            statement = reservation.execution_options(synchronize_session=False)
+
+        row = (await self.db.execute(statement)).one_or_none()
         if row is None:
             return False
 
-        campaign.spent_today_micros = row.spent_today_micros
-        campaign.total_spent_micros = row.total_spent_micros
-        campaign.status = row.status
+        # The database already holds these values. Assigning them as ordinary
+        # attributes would mark the campaign dirty and have the next flush
+        # write them straight back: a redundant UPDATE, a round trip, and in a
+        # transaction a longer hold on the row lock.
+        set_committed_value(campaign, "spent_today_micros", row.spent_today_micros)
+        set_committed_value(campaign, "total_spent_micros", row.total_spent_micros)
+        set_committed_value(campaign, "status", row.status)
         return True
 
-    async def _emit_impression_event(
+    def _queue_impression_event(
         self, auction_id, campaign, ad_slot, clearing_price,
         charged_cost_micros, bid_request
     ):
-        """
-        Push impression event to Redis Stream.
-        Redis Streams are an append-only log — perfect for event pipelines.
-        Consumer workers (analytics, billing) read from these streams.
-        """
-        try:
-            # Save impression to DB
-            impression = Impression(
-                auction_id=auction_id,
-                campaign_id=campaign.id,
-                ad_slot_id=ad_slot.id,
-                clearing_price_cents=clearing_price,
-                charged_cost_micros=charged_cost_micros,
-                country=bid_request.country,
-                device_type=bid_request.device_type.value,
-            )
-            self.db.add(impression)
+        """Hold an impression event for publish_events()."""
+        if not hasattr(self, "pending_events"):
+            self.pending_events = []
+        self.pending_events.append({
+            "auction_id": auction_id,
+            "campaign_id": campaign.id,
+            "ad_slot_id": ad_slot.id,
+            "clearing_price_cents": str(clearing_price),
+            "charged_cost_micros": str(charged_cost_micros),
+            "country": bid_request.country,
+            "device_type": bid_request.device_type.value,
+            "timestamp": datetime.utcnow().isoformat(),
+        })
 
-            # Emit to Redis Stream for real-time consumers
-            await self.redis.xadd(IMPRESSION_STREAM, {
-                "auction_id": auction_id,
-                "campaign_id": campaign.id,
-                "ad_slot_id": ad_slot.id,
-                "clearing_price_cents": str(clearing_price),
-                "charged_cost_micros": str(charged_cost_micros),
-                "country": bid_request.country,
-                "device_type": bid_request.device_type.value,
-                "timestamp": datetime.utcnow().isoformat(),
-            })
+    def publish_events(self) -> None:
+        """Push queued impression events to the Redis Stream, in the background.
+
+        Call only once the auction's write is durable. Redis Streams are an
+        append-only log that consumer workers (analytics, billing) read from;
+        none of them is the bidder, so the response does not wait on the
+        publish, and a Redis outage costs events, never auctions.
+        """
+        events, self.pending_events = getattr(self, "pending_events", []), []
+        if not events:
+            return
+        task = asyncio.create_task(self._publish(events))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+    async def _publish(self, events: list[dict]) -> None:
+        # One pipeline, one connection, one round trip, however many events:
+        # a publish per event let a batch (the seeder queues 120) exhaust the
+        # Redis connection pool.
+        try:
+            async with self.redis.pipeline(transaction=False) as pipe:
+                for event in events:
+                    pipe.xadd(IMPRESSION_STREAM, event)
+                await pipe.execute()
         except Exception as e:
-            # Never let Redis failures block the auction response
-            print(f"Warning: Redis emit failed: {e}")
+            logger.warning("Redis emit failed for %d impression event(s): %s",
+                           len(events), e)
 
     async def _save_no_fill_result(self, auction_id, ad_slot, start_time, strategy):
         result = AuctionResult(
@@ -647,7 +794,7 @@ class AuctionEngine:
         self, auction_id, bid_request, start_time, strategy, excluded=None,
         page_category=None, page_category_source="unknown",
     ) -> BidResponse:
-        latency = (time.monotonic() - start_time) * 1000
+        latency = (time.perf_counter() - start_time) * 1000
         return BidResponse(
             auction_id=auction_id,
             ad_slot_id=bid_request.ad_slot_id,

@@ -1,11 +1,13 @@
 import asyncio
 import os
+import time
 from urllib.parse import urlsplit
 
-from sqlalchemy import text
+from sqlalchemy import event, exc, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.pool import NullPool
+from sqlalchemy.util import await_only
 from app.core.config import get_settings
 
 settings = get_settings()
@@ -16,11 +18,15 @@ settings = get_settings()
 # pooler (pgBouncer/Supabase) do that job instead.
 IS_SERVERLESS = bool(os.getenv("VERCEL"))
 
+# Liveness is checked by ping_if_idle below, not by pool_pre_ping.
 pool_args = (
     {"poolclass": NullPool}
     if IS_SERVERLESS
-    else {"pool_size": 5, "max_overflow": 5, "pool_pre_ping": True}
+    else {"pool_size": 5, "max_overflow": 5}
 )
+
+# A pooled connection unused for this long is pinged before it is handed out.
+PING_IF_IDLE_SECONDS = float(os.getenv("DB_PING_IF_IDLE_SECONDS", "30"))
 
 def uses_transaction_pooler(database_url: str) -> bool:
     """Whether prepared statements must not be cached against this endpoint.
@@ -84,8 +90,49 @@ engine = create_async_engine(
     **pool_args,
 )
 
+
+if not IS_SERVERLESS:
+    # Replaces pool_pre_ping, which on asyncpg sends BEGIN, ';' and ROLLBACK:
+    # three round trips before every request, measured at 40% of a warm
+    # auction against a remote database. The transaction is there so the
+    # ping survives pgBouncer's transaction mode, but asyncpg's execute()
+    # without arguments uses the simple query protocol, which nothing has to
+    # be prepared for: one round trip, safe on every pooler.
+    #
+    # And only when the connection has sat idle. Poolers and hosts drop
+    # connections that go quiet; one handed back a moment ago is not worth a
+    # network hop to doubt. If a recently used connection is dead anyway, its
+    # request fails once and SQLAlchemy discards it from the pool.
+
+    @event.listens_for(engine.sync_engine.pool, "checkin")
+    def _mark_idle(dbapi_connection, connection_record):
+        connection_record.info["idle_since"] = time.monotonic()
+
+    @event.listens_for(engine.sync_engine.pool, "checkout")
+    def ping_if_idle(dbapi_connection, connection_record, connection_proxy):
+        idle_since = connection_record.info.get("idle_since")
+        if idle_since is None:   # freshly opened, nothing to doubt
+            return
+        if time.monotonic() - idle_since < PING_IF_IDLE_SECONDS:
+            return
+        try:
+            await_only(dbapi_connection.driver_connection.execute(";"))
+        except Exception as e:
+            # Tells the pool to discard this connection and check out another.
+            raise exc.DisconnectionError() from e
+
 AsyncSessionLocal = async_sessionmaker(
     engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
+
+# Sessions whose every statement commits on its own. The auction needs no
+# multi-statement transaction: its reads tolerate READ COMMITTED, and its only
+# write is a single atomic statement. Without a transaction there is no BEGIN
+# or COMMIT to send, which is two of the auction's database round trips.
+AutocommitSessionLocal = async_sessionmaker(
+    engine.execution_options(isolation_level="AUTOCOMMIT"),
     class_=AsyncSession,
     expire_on_commit=False,
 )
@@ -159,3 +206,9 @@ async def get_db() -> AsyncSession:
             raise
         finally:
             await session.close()
+
+
+async def get_autocommit_db() -> AsyncSession:
+    """A session for code whose every write is one self-contained statement."""
+    async with AutocommitSessionLocal() as session:
+        yield session

@@ -18,7 +18,7 @@ Publisher (SSP)  →  Bid Request  →  RTB Engine  →  Auction Result
 
 | Layer | Technology | Why |
 |-------|-----------|-----|
-| API | FastAPI (async) | An auction is ~150ms of waiting on Postgres and ~0.1ms of compute |
+| API | FastAPI (async) | An auction is mostly waiting on Postgres, not computing |
 | Database | PostgreSQL + SQLAlchemy | ACID transactions for billing accuracy |
 | Cache/Streams | Redis + Redis Streams | Event pipeline for impressions/clicks |
 | Frontend | React + Recharts | Live dashboard with auto-refresh |
@@ -252,9 +252,39 @@ a page on the site that owns the inventory.
 4. Each eligible campaign bids its `max_cpm_cents`
 5. Run the winner's configured first- or second-price auction
 6. Convert the clearing CPM to an exact per-impression microdollar charge
-7. Atomically reserve that charge against daily and lifetime budgets
-8. Impression event fires to **Redis Stream**
+7. In **one SQL statement**, reserve that charge against daily and lifetime
+   budgets and record the auction result, every bid and the impression — all
+   of them land or none do
+8. Impression event fires to **Redis Stream** once that write is durable,
+   without the response waiting on it
 9. Response returns the CPM quote, exact charge, and auction result
+
+### Latency
+
+A warm auction is **two database round trips**: the eligibility read, then the
+single charge-and-record statement. Slots are cached in process for 30s
+(`SLOT_CACHE_TTL_SECONDS`), and runs in autocommit, so there is no BEGIN or
+COMMIT to send. It used to be ten, plus three more for SQLAlchemy's
+`pool_pre_ping`, which is replaced by a one-round-trip ping of connections
+that have sat idle (`DB_PING_IF_IDLE_SECONDS`).
+
+Measured with backend, client and Postgres 15 all in Docker on one machine,
+300 sequential auctions and 600 more at 10 in flight. "Remote" puts a proxy
+in front of Postgres that makes each round trip 7.6ms, standing in for a
+hosted database:
+
+| | Before | After |
+|---|---|---|
+| Remote DB, p50 / p95 | 123 / 168 ms | **31 / 40 ms** |
+| Remote DB, throughput at 10 in flight | 19 req/s | **51 req/s** |
+| Local DB, p50 / p95 | 26 / 42 ms | **15 / 23 ms** |
+| Local DB, throughput at 10 in flight | 43 req/s | **87 req/s** |
+
+Every run was also audited row by row: spend equals the sum of impression
+charges, no budget is exceeded, each filled auction has one impression and
+one bid record per bidder, clearing prices follow the second-price rule, and
+each filled auction produced exactly one Redis event. These are local
+figures; the deployed stack has not been re-measured since.
 
 ## Data Model
 
@@ -274,12 +304,12 @@ The backend runs on **Render** (a long-lived container) and the frontend on
 ### Backend — Render
 
 `render.yaml` provisions a web service in the **Oregon** region so it sits next to
-the Supabase database (`us-west-2`). Colocation matters: an auction makes four
-sequential database round trips, and a cross-region hop multiplies every one of
+the Supabase database (`us-west-2`). Colocation matters: an auction makes two
+sequential database round trips, and a cross-region hop multiplies both of
 them.
 
-Measured on the deployed stack, a warm auction runs **~150ms end-to-end, of which
-~0.1ms is compute** — everything else is waiting on Postgres. The connection pool
+Before the round-trip work above, a warm auction measured ~150ms end-to-end on
+the deployed stack, nearly all of it waiting on Postgres. The connection pool
 is warmed at boot so connection setup is paid once rather than inside the first
 visitor's auction. Free-tier containers still spin down when idle, and a cold
 start adds several seconds on top of that.

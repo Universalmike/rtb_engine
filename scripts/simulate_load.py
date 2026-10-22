@@ -94,19 +94,19 @@ async def fire_bid(client: httpx.AsyncClient, slot_ids: list, stats: Stats, base
         "page_url":    random.choice(PAGES),
         "user_agent":  "Mozilla/5.0 (RTB-Simulator/1.0)",
     }
-    t0 = time.monotonic()
+    t0 = time.perf_counter()
     try:
         resp = await client.post(
             f"{base_url}/api/v1/auction/bid", json=payload, timeout=10.0
         )
-        latency = (time.monotonic() - t0) * 1000
+        latency = (time.perf_counter() - t0) * 1000
         if resp.status_code == 200:
             data = resp.json()
             await stats.record(latency, filled=data.get("had_fill", False))
         else:
             await stats.record(latency, filled=False, error=True)
     except Exception:
-        latency = (time.monotonic() - t0) * 1000
+        latency = (time.perf_counter() - t0) * 1000
         await stats.record(latency, filled=False, error=True)
 
 

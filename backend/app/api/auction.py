@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
-from app.core.database import get_db
+from app.core.database import get_autocommit_db, get_db
 from app.models.models import AuctionResult, Impression, Click
 from app.schemas.schemas import BidRequest, BidResponse, RecentAuction
 from app.services.auction_engine import AuctionEngine
@@ -12,17 +12,21 @@ router = APIRouter()
 @router.post("/bid", response_model=BidResponse)
 async def submit_bid_request(
     bid_request: BidRequest,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_autocommit_db)
 ):
     """
     Core RTB endpoint. A publisher fires this when a user loads a page.
 
-    The engine runs a full auction and returns the winner. Warm, that measures
-    ~150ms on the deployed free tier: four database round trips and roughly
-    0.1ms of compute. Set AUCTION_PROFILE=1 for the per-phase breakdown.
+    The engine runs a full auction and returns the winner. A warm auction is
+    two database round trips: the eligibility read, then one statement that
+    charges the winner and records the result. Set AUCTION_PROFILE=1 for the
+    per-phase breakdown.
     """
     engine = AuctionEngine(db)
-    return await engine.run_auction(bid_request)
+    response = await engine.run_auction(bid_request)
+    # Autocommit: the write has already landed, so the event may go out.
+    engine.publish_events()
+    return response
 
 
 @router.post("/impression/{auction_id}/click")

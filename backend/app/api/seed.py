@@ -19,7 +19,7 @@ from app.models.models import (
     BidRecord, AuctionResult, Impression, Click
 )
 from app.schemas.schemas import BidRequest
-from app.services.auction_engine import AuctionEngine
+from app.services.auction_engine import AuctionEngine, clear_slot_cache
 from app.ml.artifacts import load_empirical_ctr
 from app.ml.mappings import SLOT_NAME_TO_BANNER_POS
 from app.ml.simulation import lookup_ctr
@@ -63,6 +63,9 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
     # Drop and recreate every table so schema changes (new columns) take effect.
     # The demo data is disposable, so this replaces the old row-by-row wipe.
     await reset_schema()
+    # Every slot id is about to be replaced. A cached slot would outlive its
+    # row, and an auction recorded against it would violate the foreign key.
+    clear_slot_cache()
 
     # Held-out empirical CTRs drive realistic click simulation below.
     empirical = load_empirical_ctr()
@@ -258,6 +261,10 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
                 db.add(Click(impression_id=imp.id, campaign_id=imp.campaign_id))
                 click_count += 1
     await db.flush()
+
+    # Impression events go out only once the auctions behind them are durable.
+    await db.commit()
+    engine.publish_events()
 
     return {
         "message": "Database seeded successfully",
