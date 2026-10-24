@@ -27,6 +27,43 @@ const CATEGORY_SOURCE_LABELS = {
   unknown:      'not recognised',
 }
 
+// Each auction is randomly assigned an A/B arm, and the arm changes the bid:
+// the same request can fill under one and not the other.
+const STRATEGY_LABELS = {
+  control:   'Flat max CPM (control)',
+  treatment: 'Expected value (treatment)',
+}
+
+// "No fill" has different causes, and each one points the visitor somewhere
+// different. Saying "no campaign bid" when campaigns bid below the floor
+// sends them looking for a targeting problem that is not there.
+function noFillReason(result) {
+  const excluded = result.excluded || {}
+  if (excluded.floor && result.strategy === 'treatment') {
+    return 'No fill — expected-value bids fell below the floor price'
+  }
+  if (excluded.floor) return 'No fill — bids fell below the floor price'
+  if (Object.keys(excluded).length > 0) return 'No fill — no campaign matched this request'
+  return 'No fill — no campaign is eligible to bid'
+}
+
+// FastAPI returns `detail` as a string for raised errors but as a list of
+// objects for validation errors, and a proxy or firewall in front of the API
+// answers with an HTML page that has no `detail` at all.
+function errorMessage(e) {
+  if (!e.response) return 'Auction failed — is the backend running?'
+  const detail = e.response.data?.detail
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) {
+    return detail.map(d => d.msg).filter(Boolean).join('; ') || 'Invalid bid request'
+  }
+  if (e.response.status === 403) {
+    return 'The request was blocked before it reached the auction server — ' +
+      'firewalls reject URLs that look like SQL or script. Try another URL.'
+  }
+  return `Auction failed (HTTP ${e.response.status})`
+}
+
 export default function BidSimulator({ slots, onAuctionComplete }) {
   const [form, setForm] = useState({
     ad_slot_id: '',
@@ -48,7 +85,7 @@ export default function BidSimulator({ slots, onAuctionComplete }) {
       setResult(res)
       onAuctionComplete?.()
     } catch (e) {
-      setError(e.response?.data?.detail || 'Auction failed — is the backend running?')
+      setError(errorMessage(e))
     } finally {
       setLoading(false)
     }
@@ -150,7 +187,7 @@ export default function BidSimulator({ slots, onAuctionComplete }) {
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 600, marginBottom: 12 }}>
               {result.had_fill
                 ? <><CheckCircle size={16} color="var(--green)" /> Auction filled</>
-                : <><XCircle size={16} color="var(--red)" /> No fill — no campaign bid</>}
+                : <><XCircle size={16} color="var(--red)" /> {noFillReason(result)}</>}
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
               {[
@@ -165,6 +202,7 @@ export default function BidSimulator({ slots, onAuctionComplete }) {
                   : '—'],
                 ['Latency', `${result.latency_ms}ms`],
                 ['Auction type', result.auction_type?.replace('_', ' ')],
+                ['Bidding strategy', STRATEGY_LABELS[result.strategy] || result.strategy],
                 ['Auction ID', result.auction_id.slice(0, 8) + '…'],
               ].map(([k, v]) => (
                 <div key={k}>
