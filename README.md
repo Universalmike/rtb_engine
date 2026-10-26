@@ -75,9 +75,22 @@ worth, which means predicting how likely it is to be clicked.
   from held-out empirical CTRs the model never trained on, so the A/B result isn't
   circular.
 
-**Result.** At equal click-through rate, expected-value bidding lowered the effective
-cost per click by roughly 15–20% versus flat bidding — it wins the same impressions
-for less by not overpaying on low-value ones.
+- **Outcomes for every auction.** Nobody looks at the demo's ads, so the engine
+  draws each filled auction's click from the same held-out table, written in the
+  same statement as the impression. An impression without an outcome would dilute
+  the arm it lands in. Set `SIMULATE_CLICKS=0` once real click tracking calls
+  `POST /auction/impression/{id}/click`.
+- **Significance, not just a difference.** Cost per click is a ratio of
+  per-impression means, and the impression is the randomised unit, so the dashboard
+  puts a 95% delta-method interval on the treatment's change in CPC and only calls a
+  winner when that interval excludes zero. A Monte Carlo test checks that equal arms
+  are called different about 5% of the time.
+
+**Result.** No significant difference yet. On a local seed of 4,000 auctions
+(599 clicks), expected-value bidding changed cost per click by +1.3%, 95% CI −13% to
++18%. Most of the demo's ad contexts are missing from the held-out CTR table and fall
+back to one baseline rate. Where the true CTR doesn't vary, no model can find cheaper
+clicks. Rebuilding that table at a coarser grain is the next step.
 
 ## Running Locally
 
@@ -237,7 +250,7 @@ a page on the site that owns the inventory.
 | `GET` | `/api/v1/analytics/overview` | KPI aggregates |
 | `GET` | `/api/v1/analytics/campaigns` | Per-campaign performance |
 | `GET` | `/api/v1/analytics/timeseries` | Auction volume by minute |
-| `GET` | `/api/v1/analytics/ab-comparison` | Flat-CPM vs expected-value bidding, per arm |
+| `GET` | `/api/v1/analytics/ab-comparison` | Flat-CPM vs expected-value bidding, per arm, with a 95% CI on the CPC change |
 | `POST` | `/api/v1/advertisers/` | Create advertiser |
 | `POST` | `/api/v1/campaigns/` | Create campaign |
 | `POST` | `/api/v1/publishers/slots` | Create ad slot |

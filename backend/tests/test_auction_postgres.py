@@ -16,10 +16,11 @@ import pytest
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.api.analytics import ab_comparison
 from app.core.database import Base
 from app.models.models import (
     AdCreative, AdSlot, Advertiser, AuctionResult, AuctionType, BidRecord,
-    Campaign, CampaignStatus, DeviceType, Impression, Publisher,
+    Campaign, CampaignStatus, Click, DeviceType, Impression, Publisher,
 )
 from app.schemas.schemas import BidRequest
 from app.services.accounting import MICROS_PER_CENT
@@ -84,9 +85,9 @@ async def seed(sessions, *, campaigns=1, daily_budget_cents=1_000, max_cpm=150):
         return slot.id
 
 
-async def auction(sessions, slot_id):
+async def auction(sessions, slot_id, simulate_clicks=False):
     async with sessions() as s:
-        return await AuctionEngine(s).run_auction(BidRequest(
+        return await AuctionEngine(s, simulate_clicks).run_auction(BidRequest(
             ad_slot_id=slot_id, country="US", device_type="desktop",
             page_url="https://pub.example/article"))
 
@@ -202,15 +203,41 @@ def test_a_refused_charge_writes_nothing():
                       "clearing_price_cents": 11}
             records = engine._auction_records(
                 "lost-race", slot, BidRequest(ad_slot_id=slot_id), bids, result,
-                campaign.creatives[0], 110, "control")
+                campaign.creatives[0], 110, "control", clicked=True)
             charged = await engine._reserve_budget(campaign, 110, records)
 
-            counts = [await count(s, m) for m in (AuctionResult, Impression, BidRecord)]
+            counts = [await count(s, m)
+                      for m in (AuctionResult, Impression, BidRecord, Click)]
         return charged, counts
 
     charged, counts = run(scenario)
     assert charged is False
-    assert counts == [0, 0, 0]
+    assert counts == [0, 0, 0, 0]
+
+
+def test_a_drawn_click_is_recorded_with_its_impression(monkeypatch):
+    """In the same statement as the charge, against the impression it is for,
+    and visible to the A/B query."""
+    monkeypatch.setattr("app.services.auction_engine.random.random", lambda: 0.0)
+
+    async def scenario(sessions):
+        slot_id = await seed(sessions)
+        clicked = await auction(sessions, slot_id, simulate_clicks=True)
+        unclicked = await auction(sessions, slot_id, simulate_clicks=False)
+        async with sessions() as s:
+            clicks = (await s.execute(select(Click))).scalars().all()
+            impression = (await s.execute(select(Impression).where(
+                Impression.auction_id == clicked.auction_id))).scalar_one()
+            ab = await ab_comparison(s)
+        return clicked, unclicked, clicks, impression, ab
+
+    clicked, unclicked, clicks, impression, ab = run(scenario)
+    assert clicked.had_fill and unclicked.had_fill
+    assert [(c.impression_id, c.campaign_id) for c in clicks] ==         [(impression.id, clicked.winning_campaign_id)]
+    arms = {a["strategy"]: a for a in ab["arms"]}
+    assert sum(a["impressions"] for a in arms.values()) == 2
+    assert sum(a["clicks"] for a in arms.values()) == 1
+    assert ab["comparison"]["verdict"] == "insufficient_data"
 
 
 def test_concurrent_auctions_never_overspend_and_every_charge_is_recorded():

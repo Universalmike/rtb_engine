@@ -4,7 +4,6 @@ Generates advertisers, campaigns, publishers, ad slots, and runs 200 simulated a
 """
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from faker import Faker
 from datetime import datetime, timedelta
@@ -16,13 +15,11 @@ from app.core.database import get_db, reset_schema
 from app.models.models import (
     Advertiser, Campaign, CampaignStatus, AuctionType,
     Publisher, AdSlot, AdCreative, DeviceType,
-    BidRecord, AuctionResult, Impression, Click
 )
 from app.schemas.schemas import BidRequest
 from app.services.auction_engine import AuctionEngine, clear_slot_cache
 from app.ml.artifacts import load_empirical_ctr
 from app.ml.mappings import SLOT_NAME_TO_BANNER_POS
-from app.ml.simulation import lookup_ctr
 
 router = APIRouter()
 fake = Faker()
@@ -67,9 +64,7 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
     # row, and an auction recorded against it would violate the foreign key.
     clear_slot_cache()
 
-    # Held-out empirical CTRs drive realistic click simulation below.
-    empirical = load_empirical_ctr()
-    baseline_ctr = empirical.get("__baseline__", 0.163)
+    baseline_ctr = load_empirical_ctr().get("__baseline__", 0.163)
 
     # ── Advertisers ──────────────────────────────────────────────────────────
     advertiser_names = [
@@ -110,7 +105,6 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
         ("Half Page 300x600", 300, 600, DeviceType.DESKTOP, 25),
         ("Mobile Interstitial 320x480", 320, 480, DeviceType.MOBILE, 18),
     ]
-    slot_context = {}  # slot.id -> (publisher_category, banner_pos)
     slot_domain = {}   # slot.id -> the owning publisher's domain
     for pub in publishers:
         for slot_name, w, h, device, floor in slot_configs:
@@ -128,8 +122,6 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
     for pub in publishers:
         for slot in slots:
             if slot.publisher_id == pub.id:
-                slot_context[slot.id] = (pub.category,
-                                         SLOT_NAME_TO_BANNER_POS.get(slot.name, 0))
                 slot_domain[slot.id] = pub.domain
 
     # ── Campaigns ────────────────────────────────────────────────────────────
@@ -224,9 +216,11 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
     await db.flush()
 
     # ── Simulate auctions ────────────────────────────────────────────────────
-    engine = AuctionEngine(db)
+    # Clicks are drawn by the engine from held-out empirical CTRs, the same
+    # way as for any other auction, and always: the demo's A/B has no other
+    # source of outcomes, whatever SIMULATE_CLICKS says for live traffic.
+    engine = AuctionEngine(db, simulate_clicks=True)
     auction_count = 0
-    click_count = 0
     for _ in range(SEED_AUCTIONS):
         slot = random.choice(slots)
         country = random.choice(COUNTRIES)
@@ -243,28 +237,10 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
             user_agent=fake.user_agent(),
         )
         try:
-            resp = await engine.run_auction(bid_req)
+            await engine.run_auction(bid_req)
             auction_count += 1
         except Exception as e:
             print(f"Auction failed: {e}")
-            continue
-
-        if not resp.had_fill:
-            continue
-
-        # Draw a click from the held-out empirical CTR for this segment. Ground
-        # truth the served model never trained on, so measured A/B lift is real.
-        pub_category, banner_pos = slot_context[slot.id]
-        ctr = lookup_ctr(empirical, device.value, pub_category, banner_pos,
-                         datetime.utcnow().hour)
-        if random.random() < ctr:
-            imp = (await db.execute(
-                select(Impression).where(Impression.auction_id == resp.auction_id)
-            )).scalar_one_or_none()
-            if imp:
-                db.add(Click(impression_id=imp.id, campaign_id=imp.campaign_id))
-                click_count += 1
-    await db.flush()
 
     # Impression events go out only once the auctions behind them are durable.
     await db.commit()
@@ -277,5 +253,5 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
         "ad_slots": len(slots),
         "campaigns": len(campaigns),
         "auctions_simulated": auction_count,
-        "clicks_simulated": click_count,
+        "clicks_simulated": engine.simulated_clicks,
     }

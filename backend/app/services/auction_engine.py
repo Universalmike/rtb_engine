@@ -35,17 +35,26 @@ from sqlalchemy.orm.attributes import set_committed_value
 
 from app.models.models import (
     Advertiser, Campaign, CampaignStatus, AdSlot, AdCreative,
-    BidRecord, AuctionResult, Impression, gen_uuid,
+    BidRecord, AuctionResult, Impression, Click, gen_uuid,
 )
 from app.schemas.schemas import BidRequest, BidResponse, AuctionType
 from app.core.redis_client import get_redis, IMPRESSION_STREAM
+from app.ml.artifacts import load_empirical_ctr
 from app.ml.predictor import predict_ctr
+from app.ml.simulation import lookup_ctr
 from app.services.contextual import classify_url, domain_of
 logger = logging.getLogger(__name__)
 
 # Phase timings are always logged; set AUCTION_PROFILE=1 to also return them on
 # the response, which is how you read them from Swagger without server logs.
 PROFILE_AUCTIONS = os.getenv("AUCTION_PROFILE", "").lower() in {"1", "true", "yes"}
+
+# Nobody looks at the demo's ads, so no click ever arrives on its own, and an
+# impression without an outcome dilutes the A/B it is counted in. With this on,
+# every filled auction draws its click from the held-out empirical CTR, the
+# table the served model never trained on. Turn it off once real click
+# tracking calls POST /auction/impression/{id}/click.
+SIMULATE_CLICKS = os.getenv("SIMULATE_CLICKS", "1").lower() in {"1", "true", "yes"}
 
 from app.services.accounting import (
     MICROS_PER_CENT,
@@ -74,9 +83,12 @@ _background_tasks: set[asyncio.Task] = set()
 
 class AuctionEngine:
 
-    def __init__(self, db: AsyncSession):
+    def __init__(self, db: AsyncSession, simulate_clicks: Optional[bool] = None):
         self.db = db
         self.redis = get_redis()
+        self.simulate_clicks = (
+            SIMULATE_CLICKS if simulate_clicks is None else simulate_clicks)
+        self.simulated_clicks = 0
         # Impression events from auctions this engine has run, held until
         # publish_events() so nothing is announced before its write commits.
         self.pending_events: list[dict] = []
@@ -157,13 +169,20 @@ class AuctionEngine:
         # (pCTR is a property of the impression context, identical across
         # campaigns in the same auction).
         strategy = random.choice(["control", "treatment"])
+        hour = datetime.utcnow().hour
         pctr = predict_ctr(
             device_type=bid_request.device_type.value,
             publisher_category=ad_slot.publisher.category,
             banner_pos=ad_slot.banner_pos,
-            hour=datetime.utcnow().hour,
+            hour=hour,
         )
         mark("predict_ctr")
+
+        # The click depends on the impression's context, not on who wins it,
+        # so it is drawn once, before the auction, from the true CTR.
+        clicked = self.simulate_clicks and random.random() < lookup_ctr(
+            load_empirical_ctr(), bid_request.device_type.value,
+            ad_slot.publisher.category, ad_slot.banner_pos, hour)
 
         # 3. Collect bids under the assigned strategy
         bids = self._collect_bids(
@@ -194,12 +213,13 @@ class AuctionEngine:
             candidate_creative = self._pick_creative(candidate, ad_slot)
             records = self._auction_records(
                 auction_id, ad_slot, bid_request, bids, candidate_result,
-                candidate_creative, candidate_cost, strategy,
+                candidate_creative, candidate_cost, strategy, clicked=clicked,
             )
             if await self._reserve_budget(candidate, candidate_cost, records):
                 result = candidate_result
                 charged_cost_micros = candidate_cost
                 creative = candidate_creative
+                self.simulated_clicks += clicked
                 break
             bids = [bid for bid in bids if bid["campaign"].id != candidate.id]
         mark("reserve_and_record")
@@ -554,7 +574,7 @@ class AuctionEngine:
     def _auction_records(
         self, auction_id: str, ad_slot: AdSlot, bid_request: BidRequest,
         bids: list[dict], result: dict, creative: Optional[AdCreative],
-        charged_cost_micros: int, strategy: str,
+        charged_cost_micros: int, strategy: str, clicked: bool = False,
     ) -> list:
         """INSERTs recording a filled auction, to ride along with its charge.
 
@@ -566,6 +586,7 @@ class AuctionEngine:
         """
         now = datetime.utcnow()
         winner = result["winner"]
+        impression_id = gen_uuid()
 
         def typed(col, value):
             return literal(value, type_=col.type)
@@ -592,7 +613,7 @@ class AuctionEngine:
 
         def impression(reserved):
             row = {
-                Impression.id: gen_uuid(),
+                Impression.id: impression_id,
                 Impression.auction_id: auction_id,
                 Impression.campaign_id: winner.id,
                 Impression.ad_slot_id: ad_slot.id,
@@ -637,7 +658,22 @@ class AuctionEngine:
                 ).select_from(submitted.join(reserved, true())),
             ).cte("recorded_bids")
 
-        return [auction_result, impression, bid_records]
+        def click(reserved):
+            # A simulated click, when one was drawn. Postgres checks the
+            # foreign key at the end of the statement, by which time the
+            # impression it points at has been inserted alongside it.
+            row = {
+                Click.id: gen_uuid(),
+                Click.impression_id: impression_id,
+                Click.campaign_id: winner.id,
+                Click.created_at: now,
+            }
+            return insert(Click).from_select(
+                [c.key for c in row],
+                select(*(typed(c, v) for c, v in row.items())).select_from(reserved),
+            ).cte("recorded_click")
+
+        return [auction_result, impression, bid_records] + ([click] if clicked else [])
 
     async def _reserve_budget(
         self, campaign: Campaign, charge_micros: int, records=(),

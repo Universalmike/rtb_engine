@@ -66,7 +66,7 @@ export default function App() {
   const [allCampaigns, setAllCamps]   = useState([])
   const [timeseries, setTimeseries]   = useState([])
   const [recentAuctions, setRecent]   = useState([])
-  const [abData, setAbData]           = useState([])
+  const [abData, setAbData]           = useState(null)
   const [slots, setSlots]             = useState([])
   const [seeding, setSeeding]         = useState(false)
   const [seedMsg, setSeedMsg]         = useState(null)

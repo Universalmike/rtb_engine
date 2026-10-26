@@ -1,6 +1,8 @@
+import math
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, Integer, cast, desc
+from sqlalchemy import select, func, Float, Integer, cast, desc
 from app.core.database import get_db
 from app.models.models import AuctionResult, Impression, Click, Campaign
 from app.schemas.schemas import AuctionStats, CampaignStats
@@ -125,25 +127,27 @@ async def get_timeseries(db: AsyncSession = Depends(get_db)):
     ]
 
 
-def build_ab_comparison(imp_rows, clk_rows) -> list[dict]:
-    """Shape raw per-strategy rows into A/B metrics for both arms.
+def build_ab_comparison(rows) -> list[dict]:
+    """Shape raw per-strategy aggregates into A/B metrics for both arms.
 
-    imp_rows: iterable of (strategy, impressions, spend_micros)
-    clk_rows: iterable of (strategy, clicks)
+    rows: iterable of (strategy, impressions, spend_micros, clicks,
+          sum_spend_sq, sum_clicks_sq, sum_spend_clicks), the last three over
+          impressions, for the variance of the CPC (see cpc_comparison).
 
-    The headline metric is effective CPC (spend / clicks): EV bidding pays less
-    per click by not overpaying on low-pCTR impressions. CTR is reported as
-    context but is near-equal across arms by construction — click probability
-    depends on the auction context, which is assigned independently of the arm.
+    The headline metric is effective CPC (spend / clicks): EV bidding should
+    pay less per click by not overpaying on low-pCTR impressions. CTR is
+    reported as context but is near-equal across arms by construction — click
+    probability depends on the auction context, which is assigned
+    independently of the arm.
     """
-    imps = {s: (n, spend_micros) for s, n, spend_micros in imp_rows}
-    clks = {s: c for s, c in clk_rows}
+    by_strategy = {r[0]: r[1:] for r in rows}
     out = []
     for strategy in ("control", "treatment"):
-        n, spend_micros = imps.get(strategy, (0, 0))
-        n = int(n or 0)
-        spend_cents = micros_to_cents(int(spend_micros or 0))
-        clicks = int(clks.get(strategy, 0))
+        n, spend_micros, clicks, ss, kk, sk = by_strategy.get(
+            strategy, (0, 0, 0, 0, 0, 0))
+        n, clicks = int(n or 0), int(clicks or 0)
+        spend_micros = int(spend_micros or 0)
+        spend_cents = micros_to_cents(spend_micros)
         out.append({
             "strategy": strategy,
             "impressions": n,
@@ -154,28 +158,89 @@ def build_ab_comparison(imp_rows, clk_rows) -> list[dict]:
             "clicks_per_1000_cents": (
                 clicks * 1000 / spend_cents if spend_cents else 0.0
             ),
+            "cpc_log_variance": _log_cpc_variance(
+                n, spend_micros, clicks, float(ss or 0), float(kk or 0),
+                float(sk or 0)),
         })
     return out
 
 
+def _log_cpc_variance(n, spend, clicks, ss, kk, sk) -> float | None:
+    """Variance of log(CPC) for one arm, by the delta method.
+
+    CPC = sum(spend) / sum(clicks) is a ratio of two per-impression means, and
+    impressions, not clicks, are the randomised unit, so neither the spend nor
+    the click count can be treated as fixed. The delta method linearises the
+    ratio: Var(R) ~ (Var(s) - 2R Cov(s, k) + R^2 Var(k)) / (n * mean(k)^2).
+    """
+    if n < 2 or clicks == 0:
+        return None
+    mean_s, mean_k = spend / n, clicks / n
+    var_s = ss / n - mean_s ** 2
+    var_k = kk / n - mean_k ** 2
+    cov = sk / n - mean_s * mean_k
+    ratio = mean_s / mean_k
+    if ratio == 0:
+        return None
+    var_ratio = (var_s - 2 * ratio * cov + ratio ** 2 * var_k) / (n * mean_k ** 2)
+    return max(var_ratio, 0.0) / ratio ** 2
+
+
+def cpc_comparison(arms: list[dict], z: float = 1.96) -> dict:
+    """Treatment's change in CPC relative to control, with a 95% interval.
+
+    The interval is taken on log(CPC_t / CPC_c), whose variance is the sum of
+    the two arms', then mapped back to a percentage change. The verdict says
+    whether that interval excludes zero: an observed difference alone is not
+    a result, and on a few dozen clicks it is almost always noise.
+    """
+    by_strategy = {a["strategy"]: a for a in arms}
+    control, treatment = by_strategy["control"], by_strategy["treatment"]
+    clicks = {"control_clicks": control["clicks"],
+              "treatment_clicks": treatment["clicks"]}
+    var_c, var_t = control["cpc_log_variance"], treatment["cpc_log_variance"]
+    if var_c is None or var_t is None:
+        return {"verdict": "insufficient_data", "change": None,
+                "ci_low": None, "ci_high": None, **clicks}
+
+    log_ratio = math.log(treatment["eff_cpc_cents"] / control["eff_cpc_cents"])
+    half_width = z * math.sqrt(var_c + var_t)
+    low, high = math.exp(log_ratio - half_width) - 1, math.exp(log_ratio + half_width) - 1
+    if high < 0:
+        verdict = "treatment_cheaper"
+    elif low > 0:
+        verdict = "treatment_dearer"
+    else:
+        verdict = "inconclusive"
+    return {"verdict": verdict, "change": math.exp(log_ratio) - 1,
+            "ci_low": low, "ci_high": high, **clicks}
+
+
 @router.get("/ab-comparison")
 async def ab_comparison(db: AsyncSession = Depends(get_db)):
-    """Per-arm cost efficiency for the bidding A/B. Treatment (EV bidding) should
-    show a lower effective CPC — it wins the same impressions for less by shading
-    bids on low-pCTR contexts."""
-    imp_res = await db.execute(
+    """Per-arm cost efficiency for the bidding A/B, and whether the difference
+    between the arms is statistically distinguishable from noise."""
+    clicks_per_impression = (
+        select(Click.impression_id, func.count().label("clicks"))
+        .group_by(Click.impression_id)
+        .subquery()
+    )
+    spend = cast(Impression.charged_cost_micros, Float)
+    clicks = cast(func.coalesce(clicks_per_impression.c.clicks, 0), Float)
+    result = await db.execute(
         select(
             AuctionResult.strategy,
             func.count(Impression.id),
             func.sum(Impression.charged_cost_micros),
+            func.sum(clicks),
+            func.sum(spend * spend),
+            func.sum(clicks * clicks),
+            func.sum(spend * clicks),
         )
         .join(Impression, Impression.auction_id == AuctionResult.auction_id)
+        .outerjoin(clicks_per_impression,
+                   clicks_per_impression.c.impression_id == Impression.id)
         .group_by(AuctionResult.strategy)
     )
-    clk_res = await db.execute(
-        select(AuctionResult.strategy, func.count(Click.id))
-        .join(Impression, Impression.auction_id == AuctionResult.auction_id)
-        .join(Click, Click.impression_id == Impression.id)
-        .group_by(AuctionResult.strategy)
-    )
-    return build_ab_comparison(imp_res.all(), clk_res.all())
+    arms = build_ab_comparison(result.all())
+    return {"arms": arms, "comparison": cpc_comparison(arms)}
