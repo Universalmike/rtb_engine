@@ -74,7 +74,6 @@ worth, which means predicting how likely it is to be clicked.
   historical logs scores live traffic it has never seen. Simulated clicks are drawn
   from held-out empirical CTRs the model never trained on, so the A/B result isn't
   circular.
-
 - **Outcomes for every auction.** Nobody looks at the demo's ads, so the engine
   draws each filled auction's click from the same held-out table, written in the
   same statement as the impression. An impression without an outcome would dilute
@@ -85,12 +84,22 @@ worth, which means predicting how likely it is to be clicked.
   puts a 95% delta-method interval on the treatment's change in CPC and only calls a
   winner when that interval excludes zero. A Monte Carlo test checks that equal arms
   are called different about 5% of the time.
+- **A ground truth with structure.** The held-out CTR table holds every level of a
+  hierarchy (category, device × category, … × position, … × hour), each shrunk
+  toward its parent by empirical Bayes, and the simulator backs off level by level.
+  The first version only stored full-detail cells and sent everything else to one
+  global rate. 38 of the demo's 45 ad contexts had no row, the truth was flat, and
+  the A/B measured +1.3% (95% CI −13% to +18%): with nothing to find, no model can
+  find cheaper clicks. The notebook now checks the serving contexts directly. True
+  CTR spans 7–28% (p10–p90) across them, and pCTR correlates 0.55 with it.
 
-**Result.** No significant difference yet. On a local seed of 4,000 auctions
-(599 clicks), expected-value bidding changed cost per click by +1.3%, 95% CI −13% to
-+18%. Most of the demo's ad contexts are missing from the held-out CTR table and fall
-back to one baseline rate. Where the true CTR doesn't vary, no model can find cheaper
-clicks. Rebuilding that table at a coarser grain is the next step.
+**Result.** Expected-value bidding lowers cost per click by **14.6%** (95% CI
+−18.6% to −10.3%), pooled over 10 independent seeds of 6,000 auctions (~480 clicks
+per arm each). Every seed came out cheaper, and 7 of 10 were significant on their
+own. The seeds matter: each one draws a new market of campaigns, and a single
+seed's interval only covers click noise within that market. On these contexts the
+model also over-predicts on average (mean pCTR 0.222 vs a true 0.158), so
+recalibrating it on the serving distribution is the next lever.
 
 ## Running Locally
 
