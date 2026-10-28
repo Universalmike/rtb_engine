@@ -101,6 +101,50 @@ seed's interval only covers click noise within that market. On these contexts th
 model also over-predicts on average (mean pCTR 0.222 vs a true 0.158), so
 recalibrating it on the serving distribution is the next lever.
 
+### On real auction logs (iPinYou)
+
+The demo's traffic is simulated. To test the bidding rule on real auctions,
+[`notebooks/ipinyou-replay.ipynb`](notebooks/ipinyou-replay.ipynb) replays the
+[iPinYou](https://arxiv.org/abs/1407.7073) 2013 RTB logs. Season 2 covers 5
+advertisers and 12.2M real impressions, each with its real market price (the
+highest competing bid) and real click. The parsed counts match Table 3 of the
+benchmark paper exactly.
+
+- **Protocol** (as in the paper): requests replay in time order. A bid wins when
+  it beats the logged market price, pays that price and gets the logged click.
+  Bidding stops when the budget is spent.
+- **Splits, all by time:** the CTR model trains on 6–9 June, each strategy's bid
+  level is tuned on 10 June, and results come from 11–12 June (3.4M auctions,
+  2,761 clicks). Both strategies replay identical traffic, so the comparison is
+  paired.
+- **Uncertainty:** a block bootstrap over test hours (300 resamples).
+
+| Budget (share of real spend) | Extra clicks, same budget (95% CI) | Cost per click (95% CI) | Best levels in hindsight |
+|---|---|---|---|
+| 1/2  | +10.5% (+5.9% to +15.1%)  | −11.5% (−15.3% to −6.8%) | +8.5%  |
+| 1/8  | +71% (+48% to +104%)      | −41% (−50% to −32%)      | +73%   |
+| 1/32 | +233% (+147% to +308%)    | −69% (−74% to −60%)      | +190%  |
+
+The last column gives both strategies their best possible bid level in hindsight,
+on the test days themselves. This rules out the flat bidder simply drawing an
+unlucky level on a noisy tuning day.
+
+The gain grows as the budget tightens. The model is weak overall (AUC 0.565, and
+0.47–0.62 per advertiser), but its signal sits in the top pCTR decile, whose true
+CTR is 2.7× the rest. A small budget only needs that top slice.
+
+**Limitations.**
+- **Logged auctions only:** the logs only contain auctions iPinYou won, so a bid
+  above its original one is scored only on auctions that were logged. Every
+  offline evaluation on this data shares this limitation.
+- **One advertiser gains nothing:** 3476's AUC is 0.474, below chance, and EV
+  bidding doesn't help it.
+- **Over-prediction in the top decile:** pCTR there is 0.30% against a true
+  0.19%. The replay's tuned bid level absorbs this, but the engine's direct
+  pCTR × value bid would not.
+- **User tags are unused:** they're known at bid time and are the next feature to
+  add.
+
 ## Running Locally
 
 ### Prerequisites
