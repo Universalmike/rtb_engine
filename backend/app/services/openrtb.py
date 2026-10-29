@@ -4,16 +4,18 @@ On an exchange the roles change. The exchange runs the auction and sets the
 price; the bidder only says what it would pay, then learns the outcome from a
 win or loss notice, often seconds later and sometimes never. So:
 
-- Bidding reserves budget. A bid can cost at most itself, so that much is
-  held on the campaign the moment the bid is made, in the same statement
-  that logs it. Reservations count against budgets everywhere (the house
-  auction too), so any number of bids in flight cannot together overspend.
-- A win charges the exchange's clearing price and releases the reservation;
-  a loss releases it; a bid that hears nothing expires after BID_TTL_SECONDS
-  and the sweeper releases it. Each settles at most once, under a row lock.
-- A win notice that arrives after its bid expired is still charged: the ad
-  ran and the exchange bills for it. Its reservation was already released, so
-  that is the one path that can overspend. It is counted, not hidden.
+- Bidding draws on a budget lease (app/services/leasing.py). A bid can cost
+  at most itself, and that much comes out of a slice of the campaign's
+  budget the database already holds for this process. Leases count against
+  budgets everywhere (the house auction too), so any number of bids in
+  flight, across any number of processes, cannot together overspend.
+- A win charges the exchange's clearing price out of its bid's lease. A loss
+  or a silent bid (expired after BID_TTL_SECONDS) moves no money: its share
+  returns when the lease closes. Each bid settles at most once, under a row
+  lock.
+- A win notice that arrives after its lease closed is still charged: the ad
+  ran and the exchange bills for it. Its lease already gave the money back,
+  so that is the one path that can overspend. It is counted, not hidden.
 
 Eligibility, targeting, pacing, the A/B arm and pCTR are the engine's own
 code, run against the exchange's impression instead of a house slot.
@@ -37,7 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ml.artifacts import load_ctr_model
 from app.ml.predictor import predict_ctr
 from app.models.models import (
-    AdCreative, AuctionResult, Campaign, CampaignStatus, Click,
+    AdCreative, AuctionResult, BudgetLease, Campaign, CampaignStatus, Click,
     DeviceType, ExchangeBid, Impression, gen_uuid,
 )
 from app.schemas import openrtb as ortb
@@ -47,6 +49,7 @@ from app.services.accounting import (
 )
 from app.services.auction_engine import AuctionEngine
 from app.services.contextual import classify_url, domain_of
+from app.services.leasing import BOOK, LeaseBook, acquire, close_finished, lease_size
 from app.services.pacing import ahead_of_pace
 
 logger = logging.getLogger(__name__)
@@ -178,8 +181,9 @@ def model_version() -> str:
 
 
 class Bidder:
-    def __init__(self, db: AsyncSession):
+    def __init__(self, db: AsyncSession, book: LeaseBook = BOOK):
         self.db = db
+        self.book = book
         self.engine = AuctionEngine(db, simulate_clicks=False)
 
     # ── Bidding ──────────────────────────────────────────────────────────────
@@ -249,19 +253,40 @@ class Bidder:
             "user_segments": [s.id for d in (request.user.data if request.user else [])
                               for s in d.segment if s.id],
         }
-        now = datetime.now(timezone.utc)
+        now = datetime.utcnow()
         for candidate in candidates:
             campaign = candidate["campaign"]
             cost = cpm_cents_to_impression_micros(candidate["bid_cents"])
             if ahead_of_pace(campaign, cost, now):
                 continue
+            lease_id = await self._lease_for(campaign, cost, now)
+            if lease_id is None:
+                continue
             creative = self.engine._pick_creative(campaign, slot)
             bid_id = gen_uuid()
-            if await self._reserve_and_log(bid_id, request, imp, campaign, creative,
-                                           strategy, pctr, features,
-                                           candidate["bid_cents"], cost):
-                return self._bid(bid_id, imp, campaign, creative, candidate["bid_cents"], base_url)
+            await self._log_bid(bid_id, request, imp, campaign, creative, lease_id,
+                                strategy, pctr, features, candidate["bid_cents"], cost, now)
+            return self._bid(bid_id, imp, campaign, creative, candidate["bid_cents"], base_url)
         return None
+
+    async def _lease_for(self, campaign: Campaign, cost: int, now: datetime) -> Optional[str]:
+        """Room for this bid on a lease: the open one, or a new one if it is full."""
+        lease_id = self.book.take(campaign.id, cost, now)
+        if lease_id:
+            return lease_id
+        async with self.book.lock(campaign.id):
+            # Another bid may have taken a fresh lease while this one waited.
+            lease_id = self.book.take(campaign.id, cost, now)
+            if lease_id:
+                return lease_id
+            amount = lease_size(campaign, cost, now)
+            if amount < cost:
+                return None
+            lease = await acquire(self.db, campaign, amount, now)
+            if lease is None:
+                return None
+            self.book.put(campaign.id, lease)
+            return self.book.take(campaign.id, cost, now)
 
     @staticmethod
     def _without_blocked_advertisers(campaigns, blocked) -> list[Campaign]:
@@ -269,48 +294,15 @@ class Bidder:
         return [c for c in campaigns
                 if not AuctionEngine._domain_matches(advertiser_domain(c), blocked)]
 
-    async def _reserve_and_log(self, bid_id, request, imp, campaign, creative,
-                               strategy, pctr, features, bid_cents, cost) -> bool:
-        """Hold the bid's maximum cost and log the bid, in one statement.
-
-        The UPDATE only matches while today's spend, everything already
-        reserved and this bid together fit both budgets; the INSERT selects
-        from it, so a refused reservation logs nothing.
-        """
-        today = datetime.now(timezone.utc).date()
-        spent_today = AuctionEngine._spent_today_expression(today)
-        daily_limit = cast(Campaign.daily_budget_cents, BigInteger) * MICROS_PER_CENT
-        total_limit = cast(Campaign.total_budget_cents, BigInteger) * MICROS_PER_CENT
-        reserved = (
-            update(Campaign)
-            .where(
-                Campaign.id == campaign.id,
-                or_(Campaign.status == CampaignStatus.ACTIVE,
-                    and_(Campaign.status == CampaignStatus.EXHAUSTED,
-                         Campaign.spend_date < today)),
-                spent_today + Campaign.reserved_micros <= daily_limit - cost,
-                Campaign.total_spent_micros + Campaign.reserved_micros <= total_limit - cost,
-            )
-            .values(reserved_micros=Campaign.reserved_micros + cost)
-            .returning(Campaign.id, Campaign.reserved_micros)
-        ).cte("reserved")
-        row = {
-            ExchangeBid.id: bid_id, ExchangeBid.request_id: request.id[:64],
-            ExchangeBid.imp_id: imp.id[:64], ExchangeBid.campaign_id: campaign.id,
-            ExchangeBid.creative_id: creative.id, ExchangeBid.strategy: strategy,
-            ExchangeBid.model_version: model_version(), ExchangeBid.pctr: float(pctr),
-            ExchangeBid.features: json.dumps(features), ExchangeBid.bid_cents: bid_cents,
-            ExchangeBid.status: "pending", ExchangeBid.reserved_micros: cost,
-            ExchangeBid.released_micros: 0, ExchangeBid.clicked: False,
-            ExchangeBid.created_at: datetime.utcnow(),
-        }
-        logged = insert(ExchangeBid).from_select(
-            [c.key for c in row],
-            select(*(literal(v, type_=c.type) for c, v in row.items())).select_from(reserved),
-        ).cte("logged")
-        result = (await self.db.execute(
-            select(reserved.c.id, reserved.c.reserved_micros).add_cte(logged))).one_or_none()
-        return result is not None
+    async def _log_bid(self, bid_id, request, imp, campaign, creative, lease_id,
+                       strategy, pctr, features, bid_cents, cost, now) -> None:
+        """One INSERT: the bid's own row, not the campaign's contended one."""
+        await self.db.execute(insert(ExchangeBid).values(
+            id=bid_id, request_id=request.id[:64], imp_id=imp.id[:64],
+            campaign_id=campaign.id, creative_id=creative.id, lease_id=lease_id,
+            strategy=strategy, model_version=model_version(), pctr=float(pctr),
+            features=json.dumps(features), bid_cents=bid_cents, max_cost_micros=cost,
+            status="pending", clicked=False, created_at=now))
 
     @staticmethod
     def _bid(bid_id, imp, campaign, creative, bid_cents, base_url) -> ortb.Bid:
@@ -339,13 +331,17 @@ class Bidder:
         )).scalar_one_or_none()
 
     async def settle_win(self, bid_id: str, price_micros: int) -> str:
-        """Charge a won bid. Returns charged, late, duplicate or unknown."""
+        """Charge a won bid. Returns charged, late, duplicate or unknown.
+
+        The charge comes out of the bid's lease: the campaign's reservation
+        shrinks by what was spent. Late means the lease had already closed and
+        given its money back, so the charge has no reservation behind it.
+        """
         bid = await self._locked_bid(bid_id)
         if bid is None:
             return "unknown"
         if bid.status == "won":
             return "duplicate"
-        late = bid.status != "pending"
         cap = cpm_cents_to_impression_micros(bid.bid_cents)
         if price_micros > cap:
             # A second-price exchange never charges above the bid; one that
@@ -353,7 +349,9 @@ class Bidder:
             logger.warning("bid=%s win price %s above bid %s; charged the bid",
                            bid_id, price_micros, cap)
         charged = min(price_micros, cap)
-        release = bid.reserved_micros
+        # Locked after the bid, as everywhere: bid, then lease, then campaign.
+        lease = await self.db.get(BudgetLease, bid.lease_id, with_for_update=True)
+        covered = lease is not None and lease.status == "open"
 
         features = json.loads(bid.features)
         impression_id = gen_uuid()
@@ -377,21 +375,20 @@ class Bidder:
             await self.db.flush()
             self.db.add(Click(impression_id=impression_id, campaign_id=bid.campaign_id))
         bid.status, bid.charged_micros, bid.impression_id = "won", charged, impression_id
-        bid.released_micros, bid.reserved_micros = release, 0
         bid.settled_at = datetime.utcnow()
+        if covered:
+            lease.charged_micros += charged
         await self.db.flush()
-        # The campaign last. Its row is the one every bid on this campaign
-        # reserves against, and an UPDATE holds its lock until COMMIT: made
-        # first, the lock was held across every insert above, and bids queued
-        # behind each win notice (164ms p50 under load against 28ms alone).
-        await self._charge(bid.campaign_id, charged, release)
-        if late:
-            logger.warning("bid=%s won after its reservation was released; charged %s "
-                           "without one", bid_id, charged)
-        return "late" if late else "charged"
+        # The campaign last: an UPDATE holds its row lock until COMMIT, and
+        # made first it was held across every insert above.
+        await self._charge(bid.campaign_id, charged, release=charged if covered else 0)
+        if not covered:
+            logger.warning("bid=%s won after its lease closed; charged %s without a "
+                           "reservation", bid_id, charged)
+        return "charged" if covered else "late"
 
     async def _charge(self, campaign_id: str, charged: int, release: int) -> None:
-        """Spend `charged`, give back `release`. Never refused: the ad ran."""
+        """Spend `charged`, out of `release` of reserved. Never refused: the ad ran."""
         today = datetime.now(timezone.utc).date()
         spent_today = AuctionEngine._spent_today_expression(today)
         new_daily = spent_today + charged
@@ -417,50 +414,29 @@ class Bidder:
                 ),
             ).execution_options(synchronize_session=False))
 
-    async def _release(self, campaign_id: str, release: int) -> None:
-        if release:
-            await self.db.execute(
-                update(Campaign).where(Campaign.id == campaign_id)
-                .values(reserved_micros=Campaign.reserved_micros - release)
-                .execution_options(synchronize_session=False))
-
     async def settle_loss(self, bid_id: str, reason: Optional[int]) -> str:
+        """Record a loss. Its share of the lease comes back when the lease closes."""
         bid = await self._locked_bid(bid_id)
         if bid is None:
             return "unknown"
         if bid.status != "pending":
             return "duplicate"
-        release = bid.reserved_micros
-        bid.status, bid.loss_reason = "lost", reason
-        bid.released_micros, bid.reserved_micros = release, 0
-        bid.settled_at = datetime.utcnow()
+        bid.status, bid.loss_reason, bid.settled_at = "lost", reason, datetime.utcnow()
         await self.db.flush()
-        await self._release(bid.campaign_id, release)   # last, as in settle_win
-        return "released"
+        return "lost"
 
-    async def expire_stale(self, ttl_seconds: float = BID_TTL_SECONDS, batch: int = 500) -> int:
-        """Release the reservations of bids that never heard back."""
-        cutoff = datetime.utcnow() - timedelta(seconds=ttl_seconds)
-        stale = (await self.db.execute(
-            select(ExchangeBid)
-            .where(ExchangeBid.status == "pending", ExchangeBid.created_at < cutoff)
-            .order_by(ExchangeBid.created_at)
-            .limit(batch)
-            # Another sweeper, or a notice, may hold some of these: skip them.
-            .with_for_update(skip_locked=True)
-        )).scalars().all()
-        totals: dict[str, int] = {}
-        now = datetime.utcnow()
-        for bid in stale:
-            totals[bid.campaign_id] = totals.get(bid.campaign_id, 0) + bid.reserved_micros
-            bid.status, bid.settled_at = "expired", now
-            bid.released_micros, bid.reserved_micros = bid.reserved_micros, 0
-        await self.db.flush()
-        # Campaign rows last (as in settle_win), and in a fixed order, so two
-        # sweepers cannot deadlock.
-        for campaign_id in sorted(totals):
-            await self._release(campaign_id, totals[campaign_id])
-        return len(stale)
+    async def sweep(self, now: Optional[datetime] = None,
+                    ttl_seconds: float = BID_TTL_SECONDS) -> dict:
+        """Expire bids that never heard back, and close finished leases."""
+        now = now or datetime.utcnow()
+        expired = (await self.db.execute(
+            update(ExchangeBid)
+            .where(ExchangeBid.status == "pending",
+                   ExchangeBid.created_at < now - timedelta(seconds=ttl_seconds))
+            .values(status="expired", settled_at=now)
+            .execution_options(synchronize_session=False))).rowcount
+        closed, released = await close_finished(self.db, now, ttl_seconds)
+        return {"expired_bids": expired, "closed_leases": closed, "released_micros": released}
 
     async def record_click(self, bid_id: str) -> Optional[str]:
         """Count the click once and return where to send the user."""
@@ -483,11 +459,18 @@ class Bidder:
         by_status = {s: {"bids": n, "charged_micros": int(c), "clicks": int(k)} for s, n, c, k in rows}
         reserved = (await self.db.execute(
             select(func.coalesce(func.sum(Campaign.reserved_micros), 0)))).scalar()
+        open_leases, leased = (await self.db.execute(
+            select(func.count(), func.coalesce(func.sum(
+                BudgetLease.amount_micros - BudgetLease.charged_micros), 0))
+            .where(BudgetLease.status == "open"))).one()
+        taken = (await self.db.execute(select(func.count()).select_from(BudgetLease))).scalar()
         settled = sum(by_status.get(s, {}).get("bids", 0) for s in ("won", "lost"))
         won = by_status.get("won", {"bids": 0, "charged_micros": 0, "clicks": 0})
         return {
             "by_status": by_status,
             "reserved_micros": int(reserved),
+            "leases": {"open": int(open_leases), "open_unspent_micros": int(leased),
+                       "taken": int(taken)},
             "win_rate": won["bids"] / settled if settled else None,
             "ecpc_micros": won["charged_micros"] / won["clicks"] if won["clicks"] else None,
             "bid_ttl_seconds": BID_TTL_SECONDS,

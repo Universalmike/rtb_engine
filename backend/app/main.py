@@ -18,20 +18,20 @@ SWEEP_INTERVAL_SECONDS = float(os.getenv("SWEEP_INTERVAL_SECONDS", "15"))
 
 
 async def sweep_expired_bids():
-    """Release reservations of exchange bids that never got a notice.
+    """Expire exchange bids that never got a notice, and close finished leases.
 
-    Most exchanges never send loss notices, so without this every lost bid
-    would hold its campaign's budget forever.
+    Most exchanges never send loss notices, and a process can die holding
+    leases; without this their budget would stay reserved forever.
     """
     from app.services.openrtb import Bidder
     while True:
         await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
         try:
             async with AsyncSessionLocal() as session:
-                released = await Bidder(session).expire_stale()
+                swept = await Bidder(session).sweep()
                 await session.commit()
-            if released:
-                print(f"[sweeper] released {released} expired exchange bids")
+            if swept["expired_bids"] or swept["closed_leases"]:
+                print(f"[sweeper] {swept}")
         except Exception as e:
             print(f"[sweeper] failed, will retry: {e}")
 

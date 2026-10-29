@@ -20,14 +20,15 @@ from app.api import analytics, openrtb as openrtb_api
 from app.core.database import Base
 from app.models.models import (
     AdCreative, AdSlot, Advertiser, AuctionResult, AuctionType, Campaign, CampaignStatus,
-    Click, DeviceType, ExchangeBid, Impression, Publisher,
+    BudgetLease, Click, DeviceType, ExchangeBid, Impression, Publisher,
 )
 from app.schemas import openrtb as ortb
 from app.schemas.schemas import BidRequest as HouseBidRequest
 from app.services import openrtb as service
 from app.services.accounting import MICROS_PER_CENT
 from app.services.auction_engine import AuctionEngine, clear_slot_cache
-from app.services.openrtb import Bidder
+from app.services.leasing import BOOK, LEASE_SECONDS, LeaseBook
+from app.services.openrtb import BID_TTL_SECONDS, Bidder
 from app.services.pacing import ahead_of_pace, allowed_spend_micros
 
 DATABASE_URL = os.getenv("TEST_DATABASE_URL")
@@ -145,21 +146,40 @@ def request(**overrides):
     return ortb.BidRequest.model_validate(body)
 
 
-async def bid(fast, req=None):
+async def bid(fast, req=None, book=None):
     async with fast() as s:
-        return await Bidder(s).bid(req or request(), BASE)
+        bidder = Bidder(s, book) if book is not None else Bidder(s)
+        return await bidder.bid(req or request(), BASE)
 
 
-async def settle(tx, method, *args):
+async def settle(tx, method, *args, **kwargs):
     async with tx() as s:
-        outcome = await getattr(Bidder(s), method)(*args)
+        outcome = await getattr(Bidder(s), method)(*args, **kwargs)
         await s.commit()
         return outcome
+
+
+def after_leases_close():
+    """A moment by which every lease taken so far may be closed."""
+    return datetime.utcnow() + timedelta(seconds=LEASE_SECONDS + BID_TTL_SECONDS + 1)
 
 
 async def campaign(fast, campaign_id):
     async with fast() as s:
         return await s.get(Campaign, campaign_id)
+
+
+async def leases(fast):
+    async with fast() as s:
+        return (await s.execute(select(BudgetLease).order_by(BudgetLease.created_at))).scalars().all()
+
+
+@pytest.fixture(autouse=True)
+def fresh_lease_book():
+    """Each test is a freshly started process: no leases held in memory."""
+    BOOK.reset()
+    yield
+    BOOK.reset()
 
 
 @pytest.fixture
@@ -169,43 +189,64 @@ def control(monkeypatch):
 
 
 @needs_db
-def test_a_bid_reserves_its_cost_and_logs_its_features(control):
+def test_a_bid_draws_on_a_lease_and_logs_its_features(control):
     async def scenario(fast, tx):
         cid = await seed(fast)
         response = await bid(fast)
         async with fast() as s:
             logged = (await s.execute(select(ExchangeBid))).scalar_one()
-        return response, logged, await campaign(fast, cid)
+        return response, logged, await leases(fast), await campaign(fast, cid)
 
-    response, logged, c = run(scenario)
+    response, logged, [lease], c = run(scenario)
     [b] = response.seatbid[0].bid
     assert b.price == 1.50 and b.impid == "1" and (b.w, b.h) == (300, 250)
     assert b.adomain == ["adv.example"]
     assert b.nurl.endswith(f"/api/v1/openrtb/win/{b.id}?price=${{AUCTION_PRICE}}")
     assert f"/api/v1/openrtb/click/{b.id}" in b.adm
-    assert logged.status == "pending" and logged.reserved_micros == 1_500
-    assert c.reserved_micros == 1_500 and c.total_spent_micros == 0
+    # 1% of a $100 daily budget, held on the campaign; the bid's 1,500 inside it.
+    assert lease.amount_micros == 1_000_000 and lease.status == "open"
+    assert c.reserved_micros == 1_000_000 and c.total_spent_micros == 0
+    assert logged.lease_id == lease.id and logged.max_cost_micros == 1_500
     features = json.loads(logged.features)
     assert features["country"] == "NG" and features["category"] == "sports"
     assert features["user_segments"] == ["s1", "s2"]
 
 
 @needs_db
-def test_a_win_charges_the_clearing_price_once_and_records_the_impression(control):
+def test_one_lease_serves_many_bids(control):
+    """The point of leasing: the campaign's row is written once, not per bid."""
+    async def scenario(fast, tx):
+        await seed(fast)
+        responses = [await bid(fast, request(id=f"r{i}")) for i in range(50)]
+        return responses, await leases(fast)
+
+    responses, taken = run(scenario)
+    assert all(responses)
+    assert len(taken) == 1
+
+
+@needs_db
+def test_a_win_is_charged_once_out_of_its_lease(control):
     async def scenario(fast, tx):
         cid = await seed(fast)
         b = (await bid(fast)).seatbid[0].bid[0]
         first = await settle(tx, "settle_win", b.id, service.price_to_micros("0.8"))
         again = await settle(tx, "settle_win", b.id, service.price_to_micros("0.8"))
+        while_open = await campaign(fast, cid)
+        swept = await settle(tx, "sweep", now=after_leases_close())
         async with fast() as s:
             imp = (await s.execute(select(Impression))).scalar_one()
             result = (await s.execute(select(AuctionResult))).scalar_one()
-        return first, again, imp, result, await campaign(fast, cid)
+        return first, again, while_open, swept, imp, result, await leases(fast), \
+            await campaign(fast, cid)
 
-    first, again, imp, result, c = run(scenario)
+    first, again, while_open, swept, imp, result, [lease], c = run(scenario)
     assert (first, again) == ("charged", "duplicate")
-    assert c.total_spent_micros == c.spent_today_micros == 800
-    assert c.reserved_micros == 0
+    assert while_open.total_spent_micros == 800
+    assert while_open.reserved_micros == 1_000_000 - 800      # spent out of the lease
+    assert swept["closed_leases"] == 1 and swept["released_micros"] == 1_000_000 - 800
+    assert lease.status == "closed" and lease.charged_micros == 800
+    assert c.reserved_micros == 0 and c.total_spent_micros == c.spent_today_micros == 800
     assert imp.charged_cost_micros == 800 and imp.source == "openrtb" and imp.ad_slot_id is None
     assert result.source == "openrtb" and result.charged_cost_micros == 800
 
@@ -222,7 +263,8 @@ def test_concurrent_duplicate_win_notices_charge_once(control):
 
     outcomes, impressions, c = run(scenario)
     assert sorted(outcomes) == ["charged"] + ["duplicate"] * 7
-    assert impressions == 1 and c.total_spent_micros == 900 and c.reserved_micros == 0
+    assert impressions == 1 and c.total_spent_micros == 900
+    assert c.reserved_micros == 1_000_000 - 900
 
 
 @needs_db
@@ -254,7 +296,40 @@ def test_bids_in_flight_can_never_add_up_to_more_than_the_budget(control):
 
 
 @needs_db
-def test_house_auctions_cannot_spend_what_exchange_bids_hold(control):
+def test_two_processes_bidding_at_once_never_overspend_together(control):
+    """Separate lease books are separate processes: they share only the database."""
+    async def scenario(fast, tx):
+        cid = await seed(fast, daily_budget_cents=2, max_cpm=500)   # four bids' worth
+        a, b = LeaseBook(), LeaseBook()
+        responses = await asyncio.gather(*(
+            bid(fast, request(id=f"r{i}"), book=a if i % 2 else b) for i in range(40)))
+        won = [r.seatbid[0].bid[0] for r in responses if r]
+        for w in won:
+            await settle(tx, "settle_win", w.id, service.price_to_micros(str(w.price)))
+        return len(won), await leases(fast), await campaign(fast, cid)
+
+    bids, taken, c = run(scenario)
+    assert bids == 4
+    assert {lease.owner for lease in taken} == {taken[0].owner}   # same OS process here
+    assert c.spent_today_micros == 2 * MICROS_PER_CENT and c.reserved_micros == 0
+
+
+@needs_db
+def test_a_lease_takes_no_new_bids_after_its_window(control):
+    async def scenario(fast, tx):
+        await seed(fast)
+        await bid(fast, request(id="first"))
+        [(campaign_id, held)] = BOOK.held().items()
+        held.usable_until = datetime.utcnow() - timedelta(seconds=1)   # the window passes
+        await bid(fast, request(id="second"))
+        return await leases(fast)
+
+    first, second = run(scenario)
+    assert first.id != second.id
+
+
+@needs_db
+def test_house_auctions_cannot_spend_what_leases_hold(control):
     async def scenario(fast, tx):
         cid = await seed(fast, daily_budget_cents=1, max_cpm=500)
         await asyncio.gather(*(bid(fast, request(id=f"r{i}")) for i in range(2)))
@@ -276,36 +351,67 @@ def test_house_auctions_cannot_spend_what_exchange_bids_hold(control):
 
 
 @needs_db
-def test_a_loss_releases_the_reservation_and_only_once(control):
+def test_a_loss_moves_no_money_until_its_lease_closes(control):
     async def scenario(fast, tx):
         cid = await seed(fast)
         b = (await bid(fast)).seatbid[0].bid[0]
         outcomes = [await settle(tx, "settle_loss", b.id, 102),
                     await settle(tx, "settle_loss", b.id, 102)]
-        return outcomes, await campaign(fast, cid)
+        after_loss = await campaign(fast, cid)
+        await settle(tx, "sweep", now=after_leases_close())
+        return outcomes, after_loss, await campaign(fast, cid)
 
-    outcomes, c = run(scenario)
-    assert outcomes == ["released", "duplicate"]
+    outcomes, after_loss, c = run(scenario)
+    assert outcomes == ["lost", "duplicate"]
+    assert after_loss.reserved_micros == 1_000_000
     assert c.reserved_micros == 0 and c.total_spent_micros == 0
 
 
 @needs_db
-def test_silent_bids_expire_and_a_late_win_is_still_billed(control):
+def test_a_win_after_its_bid_expired_is_still_covered_by_the_open_lease(control):
     async def scenario(fast, tx):
         cid = await seed(fast)
         b = (await bid(fast)).seatbid[0].bid[0]
-        async with fast() as s:
-            await s.execute(update(ExchangeBid).values(
-                created_at=datetime.utcnow() - timedelta(minutes=5)))
-        expired = await settle(tx, "expire_stale", 60)
-        after_expiry = await campaign(fast, cid)
-        late = await settle(tx, "settle_win", b.id, 700)
-        return expired, after_expiry, late, await campaign(fast, cid)
+        # Past the bid's TTL, not yet past its lease's window plus the TTL.
+        swept = await settle(tx, "sweep",
+                             now=datetime.utcnow() + timedelta(seconds=BID_TTL_SECONDS + 1))
+        outcome = await settle(tx, "settle_win", b.id, 700)
+        return swept, outcome, await campaign(fast, cid)
 
-    expired, after_expiry, late, c = run(scenario)
-    assert expired == 1 and after_expiry.reserved_micros == 0
-    assert late == "late"
+    swept, outcome, c = run(scenario)
+    assert swept == {"expired_bids": 1, "closed_leases": 0, "released_micros": 0}
+    assert outcome == "charged"
+    assert c.total_spent_micros == 700 and c.reserved_micros == 1_000_000 - 700
+
+
+@needs_db
+def test_a_win_after_its_lease_closed_is_billed_late(control):
+    async def scenario(fast, tx):
+        cid = await seed(fast)
+        b = (await bid(fast)).seatbid[0].bid[0]
+        await settle(tx, "sweep", now=after_leases_close())
+        outcome = await settle(tx, "settle_win", b.id, 700)
+        return outcome, await campaign(fast, cid)
+
+    outcome, c = run(scenario)
+    assert outcome == "late"
     assert c.total_spent_micros == 700 and c.reserved_micros == 0
+
+
+@needs_db
+def test_leases_left_by_a_crashed_process_come_back(control):
+    async def scenario(fast, tx):
+        cid = await seed(fast)
+        await bid(fast)
+        held = await campaign(fast, cid)
+        BOOK.reset()                     # the process dies, its memory with it
+        swept = await settle(tx, "sweep", now=after_leases_close())
+        return held, swept, await campaign(fast, cid)
+
+    held, swept, c = run(scenario)
+    assert held.reserved_micros == 1_000_000
+    assert swept["closed_leases"] == 1 and swept["released_micros"] == 1_000_000
+    assert c.reserved_micros == 0
 
 
 @needs_db
@@ -343,11 +449,11 @@ def test_requests_the_bidder_must_decline(control):
         out = {name: await bid(fast, req) for name, req in declines.items()}
         async with fast() as s:
             logged = (await s.execute(select(func.count()).select_from(ExchangeBid))).scalar()
-        return out, logged
+        return out, logged, await leases(fast)
 
-    out, logged = run(scenario)
+    out, logged, taken = run(scenario)
     assert {name: r for name, r in out.items() if r is not None} == {}
-    assert logged == 0
+    assert logged == 0 and taken == []
 
 
 @needs_db
@@ -360,9 +466,9 @@ def test_an_even_paced_campaign_ahead_of_schedule_sits_out():
             await s.execute(update(Campaign).values(
                 spent_today_micros=allowed, total_spent_micros=allowed,
                 spend_date=datetime.now(timezone.utc).date()))
-        return await bid(fast), allowed, await campaign(fast, cid)
+        return await bid(fast), await campaign(fast, cid)
 
-    response, allowed, c = run(scenario)
+    response, c = run(scenario)
     assert response is None
     assert c.reserved_micros == 0
 

@@ -88,9 +88,9 @@ class Campaign(Base):
     spend_date: Mapped[date] = mapped_column(
         Date, default=lambda: datetime.utcnow().date(), nullable=False
     )
-    # Held for exchange bids still awaiting their win or loss notice: the most
-    # each could cost. It counts against both budgets everywhere, so bids in
-    # flight cannot add up to more than the campaign has left.
+    # Held by open budget leases (see app/services/leasing.py): budget set
+    # aside for exchange bids, counted against both budgets everywhere, so
+    # bids in flight cannot add up to more than the campaign has left.
     reserved_micros: Mapped[int] = mapped_column(
         BigInteger, default=0, server_default="0", nullable=False)
     # asap spends as opportunities come; even holds spend to the share of the
@@ -361,15 +361,45 @@ class Click(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
-# ─── Exchange bids (OpenRTB) ──────────────────────────────────────────────────
+# ─── Exchange bidding (OpenRTB) ───────────────────────────────────────────────
+
+class BudgetLease(Base):
+    """
+    A slice of a campaign's budget set aside for one process's exchange bids.
+
+    Taking the lease is the one write to the campaign's row; the process then
+    admits bids against it in memory. Every bid's maximum cost comes out of a
+    lease the database already holds, so no number of processes bidding at
+    once can overspend. A closed lease returns what its wins did not charge.
+    """
+    __tablename__ = "budget_leases"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=gen_uuid)
+    campaign_id: Mapped[str] = mapped_column(ForeignKey("campaigns.id"), nullable=False)
+    owner: Mapped[str] = mapped_column(String(100), nullable=False)
+    amount_micros: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    charged_micros: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    # open -> closed. Closing gives back amount - charged.
+    status: Mapped[str] = mapped_column(String(10), default="open", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    # No new bid is placed on the lease after this; it closes once its last
+    # bids are past their notice TTL as well.
+    usable_until: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    released_micros: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        Index("ix_budget_leases_status_usable", "status", "usable_until"),
+    )
+
 
 class ExchangeBid(Base):
     """
     Every bid sent to an exchange, and what became of it.
 
-    The row is the reservation's ledger entry and the bid's notice target, and
-    it doubles as the feature log: the model's inputs, its prediction and the
-    outcome, which is the training data the next model learns from.
+    The row is the bid's notice target and doubles as the feature log: the
+    model's inputs, its prediction and the outcome, which is the training
+    data the next model learns from.
     """
     __tablename__ = "exchange_bids"
 
@@ -378,18 +408,16 @@ class ExchangeBid(Base):
     imp_id: Mapped[str] = mapped_column(String(64), nullable=False)
     campaign_id: Mapped[str] = mapped_column(ForeignKey("campaigns.id"), nullable=False)
     creative_id: Mapped[str] = mapped_column(ForeignKey("ad_creatives.id"), nullable=False)
+    # The lease whose budget covers this bid's maximum cost.
+    lease_id: Mapped[str] = mapped_column(ForeignKey("budget_leases.id"), nullable=False)
     strategy: Mapped[str] = mapped_column(String(20), nullable=False)
     model_version: Mapped[str] = mapped_column(String(64), nullable=False)
     pctr: Mapped[float] = mapped_column(Float, nullable=False)
     features: Mapped[str] = mapped_column(Text, nullable=False)   # JSON
     bid_cents: Mapped[int] = mapped_column(Integer, nullable=False)  # CPM
-    # pending -> won | lost | expired. Only a pending bid holds a reservation.
+    max_cost_micros: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # pending -> won | lost | expired. Money moves on the lease, not here.
     status: Mapped[str] = mapped_column(String(10), default="pending", nullable=False)
-    reserved_micros: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    # What the last settlement took off the campaign's reservation. Written in
-    # the same UPDATE that zeroes reserved_micros, so two notices racing for
-    # one bid can never both release it.
-    released_micros: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     charged_micros: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     impression_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     loss_reason: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)

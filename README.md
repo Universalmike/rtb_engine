@@ -69,19 +69,30 @@ or `204 No Content` when it doesn't bid, as the spec has it.
   own eligibility SQL, targeting, pacing, A/B arm and pCTR model decide the
   bid. Country arrives as ISO alpha-3 and category as IAB codes, and both are
   mapped.
-- **Bids reserve budget.** The bidder doesn't know the price when it bids, so
-  it holds the most the bid could cost (the bid itself) on the campaign, in
-  the same statement that logs the bid. Reservations count against budgets
-  everywhere, the house auction included. However many bids are in flight,
-  they can't together overspend. A test fires 30 concurrent bid requests at a
-  campaign with room for two: exactly two are bid, and both win at full price
-  without crossing the budget.
+- **Bids draw on budget leases.** The bidder doesn't know the price when it
+  bids, so every bid's maximum cost (the bid itself) must already be held.
+  Holding it per bid made one campaign row the bottleneck (see below).
+  Instead, a process **leases** a slice of a campaign's budget: 1% of the
+  daily budget, never more than half of what's left, and only as much as
+  pacing allows. That's one conditional write to the campaign's row. The
+  process then admits bids against the slice in memory, and each bid is one
+  insert into its own table. Leases count against budgets everywhere, the
+  house auction included, so bids in flight across any number of processes
+  can't together overspend. Tested cases:
+  - 30 concurrent bids at a campaign with room for two produce exactly 2 bids.
+  - Two processes with separate lease books, bidding at once against room for
+    four, produce exactly 4.
+  - In every case, all of them winning at full price stays within budget.
 - **Settled exactly once.** A win charges the exchange's clearing price,
-  capped at the bid, and releases the reservation. A loss releases it. A bid
-  that hears nothing expires after `BID_TTL_SECONDS` (60), and a background
-  sweeper releases it, because most exchanges never send loss notices. Each
-  settlement takes the bid's row lock, so 8 duplicate win notices fired at
-  once charge once (tested). A win that arrives after its bid expired is still
+  capped at the bid, out of its bid's lease. A loss, or a bid that hears
+  nothing within `BID_TTL_SECONDS` (60), moves no money. A notice can land on
+  a different process from the one that bid, so the slice is never refilled;
+  its unused rest returns when the lease closes. A process stops placing bids
+  on a lease after `LEASE_SECONDS` (10), and any process's sweeper closes it
+  once its last bids are past the TTL. That includes the leases of a process
+  that crashed (tested). Each settlement takes row locks in a fixed order
+  (bid, then lease, then campaign), so 8 duplicate win notices fired at once
+  charge once (tested). A win notice arriving after its lease closed is still
   billed, since the ad ran. It's the one path that can overspend, and it's
   logged as `late`.
 - **Clicks.** The ad markup routes clicks through `/openrtb/click/{bid}`. It
@@ -107,22 +118,37 @@ or `204 No Content` when it doesn't bid, as the spec has it.
 [`scripts/simulate_exchange.py`](scripts/simulate_exchange.py) plays the
 exchange. It sends bid requests, runs a second-price auction against simulated
 competitors, calls `nurl` on a win and `lurl` on only half the losses, and
-clicks some winning ads. In a 600-request run, the bidder's books matched the
-exchange's exactly: 372 wins, $0.1327 spent, and 4 clicks. Of the 225 losses,
-107 were released by loss notices and the rest by the sweeper, and the
-reservations returned to zero.
+clicks some winning ads. After a 600-request run, an audit of the database
+found everything consistent:
+- **Spend:** campaign spend equals the sum of impression charges, and the
+  exchange's $0.1243 matches what the leases charged.
+- **Leases:** every one of the 60 balances (leased = charged + returned), and
+  none are left open.
+- **Reservations and budgets:** nothing is still reserved, and no campaign is
+  over budget.
 
-**Measured limit: one hot row.** A bid takes 25ms p50 locally on its own. Ten
-at a time, the p50 rises to about 150ms, and adding worker processes barely
-moves throughput (~65 to 75 bids/s). Postgres shows why: sampled during the
-load, 29 of 44 active backends were waiting on row locks, and most of the rest
-on WAL sync. One run-of-network campaign was the top bidder on 1,196 requests,
-so nearly every reservation updates that one campaign row and they queue
-behind each other's commits. The house auction has the same limit. The usual
-fix is **budget leasing**: each process reserves a small slice of a campaign's
-budget occasionally and spends from it in memory. That keeps the
-no-overspend guarantee with far fewer writes to the hot row, and it's the next
-piece to build.
+**Why leasing.** Before leasing, each bid reserved its cost on the campaign's
+row. Ten bids at a time took ~150ms p50, and adding worker processes barely
+moved throughput. Sampled during the load, 29 of 44 active Postgres backends
+were waiting on row locks: one run-of-network campaign was the top bidder on
+1,196 requests, so nearly every bid queued behind the last one's commit on
+that row. With leasing, the same load (4 workers, 10 bids in flight) measured:
+
+|  | Per-bid reservation | Budget leases |
+|---|---|---|
+| p50 | 104ms | **67ms** |
+| p95 | 337ms | **164ms** |
+| Throughput | 75 bids/s | **125 bids/s** |
+| Backends waiting on row locks | 29 of 44 | **0** |
+| Campaign-row writes | one per bid | one per ~26 bids (43 for 1,131) |
+
+The database is now mostly idle under that load, and the remaining limit is
+the workers' own CPU, which scales with more of them. The price of leasing is
+that budget in an open lease is unavailable to everyone else for up to
+`LEASE_SECONDS` + `BID_TTL_SECONDS`, which is why a lease is never more than
+half of what a campaign has left. The house auction still charges the
+campaign row directly, so it keeps the hot-row limit; leasing it the same way
+is the next step.
 
 ## Machine Learning: CTR-Driven Bidding
 
