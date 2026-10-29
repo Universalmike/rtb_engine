@@ -6,6 +6,7 @@ import AuctionFeed from './components/AuctionFeed'
 import CampaignTable from './components/CampaignTable'
 import AbComparison from './components/AbComparison'
 import BidSimulator from './components/BidSimulator'
+import ReplayPanel from './components/ReplayPanel'
 import {
   fetchOverview, fetchCampaignStats, fetchTimeseries, fetchAbComparison,
   fetchRecentAuctions, fetchAdSlots, fetchCampaigns, seedDatabase,
@@ -285,6 +286,11 @@ export default function App() {
         {/* ── A/B Bidding Comparison ─────────────────────────────────────── */}
         <div style={{ marginBottom: 16 }}>
           <AbComparison data={abData} />
+        </div>
+
+        {/* ── Real auction replay (iPinYou logs) ─────────────────────────── */}
+        <div style={{ marginBottom: 16 }}>
+          <ReplayPanel />
         </div>
 
         {/* ── Campaign Table ─────────────────────────────────────────────── */}

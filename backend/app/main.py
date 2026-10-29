@@ -7,6 +7,7 @@ from app.core.database import (
     DISABLE_STATEMENT_CACHE, engine, ensure_schema, warm_connection_pool,
 )
 from app.core.config import get_settings
+from app.ml import ipinyou
 
 settings = get_settings()
 
@@ -43,6 +44,12 @@ async def lifespan(app: FastAPI):
         print(f"[startup] Connection pool warm ({opened} connections)")
     except Exception as e:
         print(f"[startup] Pool warm-up skipped: {e}")
+
+    # The replay sample takes about half a second to parse; not in a request.
+    model, sample = ipinyou.load_model(), ipinyou.load_sample()
+    print(f"[startup] iPinYou replay: "
+          + (f"model {model['version']}, {len(sample)} requests" if model and sample
+             else "artifacts missing, /api/v1/replay disabled"))
     yield
     # Shutdown: dispose connection pool
     await engine.dispose()
@@ -68,7 +75,7 @@ app.add_middleware(
 )
 
 # ─── Routers (added as we build each day) ────────────────────────────────────
-from app.api import advertisers, campaigns, publishers, auction, analytics, seed
+from app.api import advertisers, campaigns, publishers, auction, analytics, seed, replay
 
 app.include_router(advertisers.router, prefix="/api/v1/advertisers", tags=["Advertisers"])
 app.include_router(campaigns.router, prefix="/api/v1/campaigns", tags=["Campaigns"])
@@ -76,6 +83,7 @@ app.include_router(publishers.router, prefix="/api/v1/publishers", tags=["Publis
 app.include_router(auction.router, prefix="/api/v1/auction", tags=["Auction"])
 app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["Analytics"])
 app.include_router(seed.router, prefix="/api/v1/seed", tags=["Seed"])
+app.include_router(replay.router, prefix="/api/v1/replay", tags=["Replay"])
 
 
 @app.get("/")

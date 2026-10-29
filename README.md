@@ -108,42 +108,102 @@ The demo's traffic is simulated. To test the bidding rule on real auctions,
 [iPinYou](https://arxiv.org/abs/1407.7073) 2013 RTB logs. Season 2 covers 5
 advertisers and 12.2M real impressions, each with its real market price (the
 highest competing bid) and real click. The parsed counts match Table 3 of the
-benchmark paper exactly.
+benchmark paper exactly. Results are in
+[`notebooks/results/ipinyou_replay_results.json`](notebooks/results/ipinyou_replay_results.json).
 
 - **Protocol** (as in the paper): requests replay in time order. A bid wins when
   it beats the logged market price, pays that price and gets the logged click.
   Bidding stops when the budget is spent.
-- **Splits, all by time:** the CTR model trains on 6–9 June, each strategy's bid
-  level is tuned on 10 June, and results come from 11–12 June (3.4M auctions,
-  2,761 clicks). Both strategies replay identical traffic, so the comparison is
-  paired.
+- **Splits, all by time:** models train on 6–9 June. The model choice, its
+  calibration, the guardrail and each strategy's bid level are all fixed on
+  10 June. Results come from 11–12 June (3.4M auctions, 2,761 clicks), which
+  nothing above ever sees. Every strategy replays identical traffic, so the
+  comparisons are paired.
 - **Uncertainty:** a block bootstrap over test hours (300 resamples).
 
-| Budget (share of real spend) | Extra clicks, same budget (95% CI) | Cost per click (95% CI) | Best levels in hindsight |
-|---|---|---|---|
-| 1/2  | +10.5% (+5.9% to +15.1%)  | −11.5% (−15.3% to −6.8%) | +8.5%  |
-| 1/8  | +71% (+48% to +104%)      | −41% (−50% to −32%)      | +73%   |
-| 1/32 | +233% (+147% to +308%)    | −69% (−74% to −60%)      | +190%  |
+**Model.** Four candidates, chosen by tune-day log loss:
 
-The last column gives both strategies their best possible bid level in hindsight,
-on the test days themselves. This rules out the flat bidder simply drawing an
-unlucky level on a noisy tuning day.
+| Model | Test AUC | Test log loss |
+|---|---|---|
+| Logistic regression, request features | 0.565 | 0.006462 |
+| **Logistic regression + user tags** (chosen) | **0.803** | **0.006006** |
+| Gradient boosting, request features | 0.711 | 0.006244 |
+| Gradient boosting + user tags | 0.735 | 0.008476 |
 
-The gain grows as the budget tightens. The model is weak overall (AUC 0.565, and
-0.47–0.62 per advertiser), but its signal sits in the top pCTR decile, whose true
-CTR is 2.7× the rest. A small budget only needs that top slice.
+User tags are the interest segments logged in each bid request. They're known
+at bid time and carry most of the signal. Gradient boosting with its default
+settings came out overconfident: with tags, its log loss is worse than without
+them. It wasn't tuned, and the simpler model won.
+
+**Calibration.** The raw model under-predicts (mean pCTR 0.70× the true CTR).
+Isotonic regression fitted on the tune day brings that to 0.93× and cuts the
+relative calibration error over pCTR deciles from 49% to 11.5%, with AUC
+unchanged (0.805). Platt scaling barely helped (52%). This matters for the
+engine, whose bid is pCTR × value: a biased pCTR is a biased bid.
+
+**Guardrail.** An advertiser on whose tune-day traffic the model ranks below
+AUC 0.55 bids flat instead. The threshold was fixed before any result. It didn't
+fire: with user tags, the advertiser the first model couldn't rank (3476, AUC
+0.474) reached 0.884.
+
+**Result.** Clicks won at the same budget, EV bidding against a flat bid:
+
+| Budget (share of real spend) | Request features only | **+ user tags, calibrated** (95% CI) | Cost per click (95% CI) | Best levels in hindsight |
+|---|---|---|---|---|
+| 1/2  | +10.5% | **+45%** (+40% to +54%)    | −35% (−38% to −32%) | +40%  |
+| 1/8  | +71%   | **+296%** (+259% to +354%) | −75% (−78% to −73%) | +287% |
+| 1/32 | +233%  | **+574%** (+449% to +739%) | −85% (−88% to −82%) | +473% |
+
+The last column gives every strategy its best possible bid level in hindsight,
+on the test days themselves. This rules out a gap that comes from a level badly
+chosen on one noisy tuning day. The request-features column is the first
+version of this notebook. It's kept in the replay and reproduces its original
+numbers exactly, which checks that the pipeline didn't change underneath it.
+
+The gain grows as the budget tightens: a small budget only buys the best few
+percent of impressions, and finding those is exactly what the model does.
 
 **Limitations.**
 - **Logged auctions only:** the logs only contain auctions iPinYou won, so a bid
   above its original one is scored only on auctions that were logged. Every
   offline evaluation on this data shares this limitation.
-- **One advertiser gains nothing:** 3476's AUC is 0.474, below chance, and EV
-  bidding doesn't help it.
-- **Over-prediction in the top decile:** pCTR there is 0.30% against a true
-  0.19%. The replay's tuned bid level absorbs this, but the engine's direct
-  pCTR × value bid would not.
-- **User tags are unused:** they're known at bid time and are the next feature to
-  add.
+- **Small budgets are noisy per advertiser:** at 1/32, two of the five
+  advertisers won slightly fewer clicks than with the request-features model.
+  The pooled gain holds, but the 1/2-budget figure is the conservative one.
+- **Two models, by design:** this model needs an iPinYou bid request's features
+  (its exchanges, regions, domains and user segments), which a visitor typing a
+  URL doesn't have. So it serves the replayed real requests below, and the URL
+  simulator keeps the Avazu model, whose features any request can supply.
+
+### Serving it: the model in the engine
+
+The notebook exports the chosen model as plain JSON (version-hashed): per-feature
+weights, user-tag weights, and the isotonic calibration's breakpoints.
+[`app/ml/ipinyou.py`](backend/app/ml/ipinyou.py) scores it in pure Python, in
+about 10 µs per request, with no scikit-learn on the server.
+
+- **Train/serve parity.** The notebook also exports 22,745 real test requests,
+  each with the pCTR it gave them. [`test_ipinyou_parity.py`](backend/tests/test_ipinyou_parity.py)
+  rescores every one in the serving code. The worst disagreement is 5.5 × 10⁻¹⁵
+  before calibration and 6.7 × 10⁻¹⁴ after: floating-point rounding. A feature
+  string formatted differently, or an unseen value sent to the wrong bucket,
+  would fail it.
+- **Replay endpoint.** `GET /api/v1/replay/auction` takes a real request, prices
+  it with the served model, and bids with both strategies at the levels tuned on
+  the notebook's tune day. Each strategy wins when its bid beats the price that
+  really won, and the response says whether the ad was really clicked. The
+  dashboard's **Real auction replay** panel shows it, and its headline numbers
+  come from the model artifact, not from text in the UI.
+- **The sample.** It holds 20,000 test requests drawn uniformly, plus every
+  clicked test request so a visitor can find some. A random replay only draws
+  from the uniform part, so clicks show up at their real rate (about 1 in 1,200
+  requests). The "clicked" button draws from the clicked part, and the panel
+  says so. In the sample, clicked requests sit at the 79th percentile of
+  predicted CTR on average, against the 49th for random ones.
+- **Data credit.** The sample comes from the iPinYou RTB dataset released for
+  research (Zhang et al., [*Real-Time Bidding Benchmarking with iPinYou
+  Dataset*](https://arxiv.org/abs/1407.7073), 2014). Bid IDs, user IDs, IPs and
+  URLs are removed. Domains were already anonymised in the release.
 
 ## Running Locally
 
@@ -304,6 +364,8 @@ a page on the site that owns the inventory.
 | `GET` | `/api/v1/analytics/campaigns` | Per-campaign performance |
 | `GET` | `/api/v1/analytics/timeseries` | Auction volume by minute |
 | `GET` | `/api/v1/analytics/ab-comparison` | Flat-CPM vs expected-value bidding, per arm, with a 95% CI on the CPC change |
+| `GET` | `/api/v1/replay/auction` | Replay a real iPinYou request through the served model (`?clicked=true` for a clicked one) |
+| `GET` | `/api/v1/replay/summary` | The served model's version, metrics and offline evaluation |
 | `POST` | `/api/v1/advertisers/` | Create advertiser |
 | `POST` | `/api/v1/campaigns/` | Create campaign |
 | `POST` | `/api/v1/publishers/slots` | Create ad slot |

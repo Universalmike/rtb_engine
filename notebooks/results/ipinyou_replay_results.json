@@ -1,4 +1,5 @@
 {
+  "version": 2,
   "data": "iPinYou season 2 (training2nd), 5 advertisers, 6-12 June 2013",
   "splits": {
     "fit": [
@@ -25,37 +26,108 @@
     "tune": 1546,
     "test": 2761
   },
-  "model": {
-    "type": "logistic_regression",
-    "C": 0.1,
-    "features": [
-      "advertiser",
-      "adexchange",
-      "region",
-      "city",
-      "domain",
-      "slotsize",
-      "slotvisibility",
-      "slotformat",
-      "device",
-      "os",
-      "browser",
-      "hour"
-    ],
-    "metrics": {
-      "auc": 0.5649629509822112,
-      "logloss": 0.006461887670977443,
-      "brier": 0.0008097681856939838,
-      "mean_pctr": 0.0007837951203173262,
-      "test_ctr": 0.0008113286277644238
+  "user_tags": 43,
+  "models": [
+    {
+      "model": "lr_base",
+      "seconds": 62,
+      "tune_auc": 0.5665207118977127,
+      "tune_logloss": 0.0064153716647419685,
+      "test_auc": 0.5649629509822112,
+      "test_logloss": 0.006461887670977442
     },
-    "auc_per_advertiser": {
-      "1458": 0.5139603005093527,
-      "3358": 0.6193519355849094,
-      "3386": 0.5858359522475138,
-      "3427": 0.5928454066362684,
-      "3476": 0.4736480224346674
+    {
+      "model": "lr_tags",
+      "seconds": 67,
+      "tune_auc": 0.7999148526755842,
+      "tune_logloss": 0.005959462207133996,
+      "test_auc": 0.8030108290094415,
+      "test_logloss": 0.006005528636510492
+    },
+    {
+      "model": "gbt_base",
+      "seconds": 87,
+      "tune_auc": 0.7123899322803199,
+      "tune_logloss": 0.006208837797589488,
+      "test_auc": 0.7109114622645624,
+      "test_logloss": 0.006243784945700618
+    },
+    {
+      "model": "gbt_tags",
+      "seconds": 80,
+      "tune_auc": 0.7243616227255926,
+      "tune_logloss": 0.008244245426330784,
+      "test_auc": 0.734934188770558,
+      "test_logloss": 0.008475742188859874
     }
+  ],
+  "chosen_model": "lr_tags",
+  "calibration": {
+    "method": "isotonic, fitted on the tune day",
+    "test": [
+      {
+        "version": "raw",
+        "auc": 0.8030108290094415,
+        "logloss": 0.006005528636510492,
+        "brier": 0.0008070284989470818,
+        "ece": 0.00039900577735902667,
+        "ece_relative": 0.49179304625114423,
+        "mean_pctr_over_ctr": 0.7023311096596573
+      },
+      {
+        "version": "platt",
+        "auc": 0.8030108290094415,
+        "logloss": 0.005985008588152678,
+        "brier": 0.0008067864731050407,
+        "ece": 0.0004181528795922138,
+        "ece_relative": 0.5153927339460627,
+        "mean_pctr_over_ctr": 0.887199581376469
+      },
+      {
+        "version": "isotonic",
+        "auc": 0.8050918914976443,
+        "logloss": 0.005813501679470273,
+        "brier": 0.0008029661187036343,
+        "ece": 9.328340836248149e-05,
+        "ece_relative": 0.11497610853387405,
+        "mean_pctr_over_ctr": 0.9267370904021001
+      }
+    ]
+  },
+  "guardrail": {
+    "min_tune_auc": 0.55,
+    "advertisers": [
+      {
+        "advertiser": "1458",
+        "tune_auc": 0.9133805492864656,
+        "test_auc": 0.9247404760687827,
+        "guarded": false
+      },
+      {
+        "advertiser": "3358",
+        "tune_auc": 0.7179528470158685,
+        "test_auc": 0.7189827594211817,
+        "guarded": false
+      },
+      {
+        "advertiser": "3386",
+        "tune_auc": 0.6817503431547307,
+        "test_auc": 0.6761485358022961,
+        "guarded": false
+      },
+      {
+        "advertiser": "3427",
+        "tune_auc": 0.8848940591387047,
+        "test_auc": 0.8819235721174306,
+        "guarded": false
+      },
+      {
+        "advertiser": "3476",
+        "tune_auc": 0.9027943092130468,
+        "test_auc": 0.8839967727013499,
+        "guarded": false
+      }
+    ]
   },
   "bootstrap": {
     "blocks": "test hours",
@@ -64,8 +136,9 @@
   "summary": [
     {
       "budget": "1/32",
+      "strategy": "ev_v1",
       "flat_clicks": 127,
-      "ev_clicks": 423,
+      "clicks": 423,
       "click_lift": 2.3307086614173227,
       "lift_ci": [
         1.4657927668627206,
@@ -78,9 +151,42 @@
       ]
     },
     {
+      "budget": "1/32",
+      "strategy": "ev",
+      "flat_clicks": 127,
+      "clicks": 856,
+      "click_lift": 5.74015748031496,
+      "lift_ci": [
+        4.488926174496644,
+        7.389451858029839
+      ],
+      "ecpc_change": -0.8529834032432693,
+      "ecpc_ci": [
+        -0.8816616798653613,
+        -0.8215025235676627
+      ]
+    },
+    {
+      "budget": "1/32",
+      "strategy": "ev_guard",
+      "flat_clicks": 127,
+      "clicks": 856,
+      "click_lift": 5.74015748031496,
+      "lift_ci": [
+        4.488926174496644,
+        7.389451858029839
+      ],
+      "ecpc_change": -0.8529834032432693,
+      "ecpc_ci": [
+        -0.8816616798653613,
+        -0.8215025235676627
+      ]
+    },
+    {
       "budget": "1/8",
+      "strategy": "ev_v1",
       "flat_clicks": 406,
-      "ev_clicks": 694,
+      "clicks": 694,
       "click_lift": 0.7093596059113301,
       "lift_ci": [
         0.47602925652239475,
@@ -93,9 +199,42 @@
       ]
     },
     {
+      "budget": "1/8",
+      "strategy": "ev",
+      "flat_clicks": 406,
+      "clicks": 1606,
+      "click_lift": 2.955665024630542,
+      "lift_ci": [
+        2.5940571923650526,
+        3.539131652661064
+      ],
+      "ecpc_change": -0.7480128305663363,
+      "ecpc_ci": [
+        -0.7814572057734049,
+        -0.7256302992899722
+      ]
+    },
+    {
+      "budget": "1/8",
+      "strategy": "ev_guard",
+      "flat_clicks": 406,
+      "clicks": 1606,
+      "click_lift": 2.955665024630542,
+      "lift_ci": [
+        2.5940571923650526,
+        3.539131652661064
+      ],
+      "ecpc_change": -0.7480128305663363,
+      "ecpc_ci": [
+        -0.7814572057734049,
+        -0.7256302992899722
+      ]
+    },
+    {
       "budget": "1/2",
+      "strategy": "ev_v1",
       "flat_clicks": 1562,
-      "ev_clicks": 1726,
+      "clicks": 1726,
       "click_lift": 0.10499359795134433,
       "lift_ci": [
         0.05880721478969072,
@@ -106,6 +245,100 @@
         -0.15313974422900611,
         -0.06801585465207692
       ]
+    },
+    {
+      "budget": "1/2",
+      "strategy": "ev",
+      "flat_clicks": 1562,
+      "clicks": 2268,
+      "click_lift": 0.4519846350832266,
+      "lift_ci": [
+        0.3951498207544177,
+        0.541906863021434
+      ],
+      "ecpc_change": -0.35172078096210935,
+      "ecpc_ci": [
+        -0.3778687208759175,
+        -0.3216891279986729
+      ]
+    },
+    {
+      "budget": "1/2",
+      "strategy": "ev_guard",
+      "flat_clicks": 1562,
+      "clicks": 2268,
+      "click_lift": 0.4519846350832266,
+      "lift_ci": [
+        0.3951498207544177,
+        0.541906863021434
+      ],
+      "ecpc_change": -0.35172078096210935,
+      "ecpc_ci": [
+        -0.3778687208759175,
+        -0.3216891279986729
+      ]
+    }
+  ],
+  "hindsight_clicks": [
+    {
+      "budget": "1/32",
+      "strategy": "flat",
+      "clicks": 153
+    },
+    {
+      "budget": "1/32",
+      "strategy": "ev_v1",
+      "clicks": 444
+    },
+    {
+      "budget": "1/32",
+      "strategy": "ev",
+      "clicks": 877
+    },
+    {
+      "budget": "1/32",
+      "strategy": "ev_guard",
+      "clicks": 877
+    },
+    {
+      "budget": "1/8",
+      "strategy": "flat",
+      "clicks": 423
+    },
+    {
+      "budget": "1/8",
+      "strategy": "ev_v1",
+      "clicks": 733
+    },
+    {
+      "budget": "1/8",
+      "strategy": "ev",
+      "clicks": 1636
+    },
+    {
+      "budget": "1/8",
+      "strategy": "ev_guard",
+      "clicks": 1636
+    },
+    {
+      "budget": "1/2",
+      "strategy": "flat",
+      "clicks": 1645
+    },
+    {
+      "budget": "1/2",
+      "strategy": "ev_v1",
+      "clicks": 1785
+    },
+    {
+      "budget": "1/2",
+      "strategy": "ev",
+      "clicks": 2300
+    },
+    {
+      "budget": "1/2",
+      "strategy": "ev_guard",
+      "clicks": 2300
     }
   ],
   "per_advertiser": [
@@ -122,12 +355,32 @@
     {
       "advertiser": "1458",
       "budget": "1/32",
-      "strategy": "ev",
+      "strategy": "ev_v1",
       "level": 18,
       "imps": 82754,
       "clicks": 86,
       "cost": 1893961,
       "ecpc": 22022.802325581397
+    },
+    {
+      "advertiser": "1458",
+      "budget": "1/32",
+      "strategy": "ev",
+      "level": 12,
+      "imps": 48755,
+      "clicks": 334,
+      "cost": 1893914,
+      "ecpc": 5670.4011976047905
+    },
+    {
+      "advertiser": "1458",
+      "budget": "1/32",
+      "strategy": "ev_guard",
+      "level": 12,
+      "imps": 48755,
+      "clicks": 334,
+      "cost": 1893914,
+      "ecpc": 5670.4011976047905
     },
     {
       "advertiser": "1458",
@@ -142,12 +395,32 @@
     {
       "advertiser": "1458",
       "budget": "1/8",
-      "strategy": "ev",
+      "strategy": "ev_v1",
       "level": 58,
       "imps": 265005,
       "clicks": 182,
       "cost": 7575853,
       "ecpc": 41625.56593406593
+    },
+    {
+      "advertiser": "1458",
+      "budget": "1/8",
+      "strategy": "ev",
+      "level": 44,
+      "imps": 191830,
+      "clicks": 608,
+      "cost": 7539040,
+      "ecpc": 12399.736842105263
+    },
+    {
+      "advertiser": "1458",
+      "budget": "1/8",
+      "strategy": "ev_guard",
+      "level": 44,
+      "imps": 191830,
+      "clicks": 608,
+      "cost": 7539040,
+      "ecpc": 12399.736842105263
     },
     {
       "advertiser": "1458",
@@ -162,12 +435,32 @@
     {
       "advertiser": "1458",
       "budget": "1/2",
-      "strategy": "ev",
+      "strategy": "ev_v1",
       "level": 120,
       "imps": 603273,
       "clicks": 469,
       "cost": 30303458,
       "ecpc": 64612.91684434968
+    },
+    {
+      "advertiser": "1458",
+      "budget": "1/2",
+      "strategy": "ev",
+      "level": 158,
+      "imps": 578465,
+      "clicks": 720,
+      "cost": 28420602,
+      "ecpc": 39473.058333333334
+    },
+    {
+      "advertiser": "1458",
+      "budget": "1/2",
+      "strategy": "ev_guard",
+      "level": 158,
+      "imps": 578465,
+      "clicks": 720,
+      "cost": 28420602,
+      "ecpc": 39473.058333333334
     },
     {
       "advertiser": "3358",
@@ -182,12 +475,32 @@
     {
       "advertiser": "3358",
       "budget": "1/32",
-      "strategy": "ev",
+      "strategy": "ev_v1",
       "level": 14,
       "imps": 28019,
       "clicks": 82,
       "cost": 1288268,
       "ecpc": 15710.585365853658
+    },
+    {
+      "advertiser": "3358",
+      "budget": "1/32",
+      "strategy": "ev",
+      "level": 16,
+      "imps": 17804,
+      "clicks": 68,
+      "cost": 892248,
+      "ecpc": 13121.29411764706
+    },
+    {
+      "advertiser": "3358",
+      "budget": "1/32",
+      "strategy": "ev_guard",
+      "level": 16,
+      "imps": 17804,
+      "clicks": 68,
+      "cost": 892248,
+      "ecpc": 13121.29411764706
     },
     {
       "advertiser": "3358",
@@ -202,12 +515,32 @@
     {
       "advertiser": "3358",
       "budget": "1/8",
-      "strategy": "ev",
+      "strategy": "ev_v1",
       "level": 86,
       "imps": 128102,
       "clicks": 152,
       "cost": 6981964,
       "ecpc": 45933.97368421053
+    },
+    {
+      "advertiser": "3358",
+      "budget": "1/8",
+      "strategy": "ev",
+      "level": 70,
+      "imps": 88672,
+      "clicks": 193,
+      "cost": 6382490,
+      "ecpc": 33069.896373056996
+    },
+    {
+      "advertiser": "3358",
+      "budget": "1/8",
+      "strategy": "ev_guard",
+      "level": 70,
+      "imps": 88672,
+      "clicks": 193,
+      "cost": 6382490,
+      "ecpc": 33069.896373056996
     },
     {
       "advertiser": "3358",
@@ -222,12 +555,32 @@
     {
       "advertiser": "3358",
       "budget": "1/2",
-      "strategy": "ev",
+      "strategy": "ev_v1",
       "level": 182,
       "imps": 379031,
       "clicks": 311,
       "cost": 24855076,
       "ecpc": 79919.85852090032
+    },
+    {
+      "advertiser": "3358",
+      "budget": "1/2",
+      "strategy": "ev",
+      "level": 302,
+      "imps": 314164,
+      "clicks": 350,
+      "cost": 21839310,
+      "ecpc": 62398.02857142857
+    },
+    {
+      "advertiser": "3358",
+      "budget": "1/2",
+      "strategy": "ev_guard",
+      "level": 302,
+      "imps": 314164,
+      "clicks": 350,
+      "cost": 21839310,
+      "ecpc": 62398.02857142857
     },
     {
       "advertiser": "3386",
@@ -242,12 +595,32 @@
     {
       "advertiser": "3386",
       "budget": "1/32",
-      "strategy": "ev",
+      "strategy": "ev_v1",
       "level": 22,
       "imps": 78883,
       "clicks": 141,
       "cost": 2010807,
       "ecpc": 14261.04255319149
+    },
+    {
+      "advertiser": "3386",
+      "budget": "1/32",
+      "strategy": "ev",
+      "level": 14,
+      "imps": 48976,
+      "clicks": 123,
+      "cost": 2010801,
+      "ecpc": 16347.975609756097
+    },
+    {
+      "advertiser": "3386",
+      "budget": "1/32",
+      "strategy": "ev_guard",
+      "level": 14,
+      "imps": 48976,
+      "clicks": 123,
+      "cost": 2010801,
+      "ecpc": 16347.975609756097
     },
     {
       "advertiser": "3386",
@@ -262,12 +635,32 @@
     {
       "advertiser": "3386",
       "budget": "1/8",
-      "strategy": "ev",
+      "strategy": "ev_v1",
       "level": 58,
       "imps": 245145,
       "clicks": 181,
       "cost": 7744414,
       "ecpc": 42786.81767955801
+    },
+    {
+      "advertiser": "3386",
+      "budget": "1/8",
+      "strategy": "ev",
+      "level": 50,
+      "imps": 169127,
+      "clicks": 236,
+      "cost": 7889711,
+      "ecpc": 33430.97881355932
+    },
+    {
+      "advertiser": "3386",
+      "budget": "1/8",
+      "strategy": "ev_guard",
+      "level": 50,
+      "imps": 169127,
+      "clicks": 236,
+      "cost": 7889711,
+      "ecpc": 33430.97881355932
     },
     {
       "advertiser": "3386",
@@ -282,12 +675,32 @@
     {
       "advertiser": "3386",
       "budget": "1/2",
-      "strategy": "ev",
+      "strategy": "ev_v1",
       "level": 120,
       "imps": 600612,
       "clicks": 434,
       "cost": 32173445,
       "ecpc": 74132.36175115207
+    },
+    {
+      "advertiser": "3386",
+      "budget": "1/2",
+      "strategy": "ev",
+      "level": 182,
+      "imps": 546028,
+      "clicks": 472,
+      "cost": 32173401,
+      "ecpc": 68163.98516949153
+    },
+    {
+      "advertiser": "3386",
+      "budget": "1/2",
+      "strategy": "ev_guard",
+      "level": 182,
+      "imps": 546028,
+      "clicks": 472,
+      "cost": 32173401,
+      "ecpc": 68163.98516949153
     },
     {
       "advertiser": "3427",
@@ -302,12 +715,32 @@
     {
       "advertiser": "3427",
       "budget": "1/32",
-      "strategy": "ev",
+      "strategy": "ev_v1",
       "level": 20,
       "imps": 80678,
       "clicks": 107,
       "cost": 1955361,
       "ecpc": 18274.40186915888
+    },
+    {
+      "advertiser": "3427",
+      "budget": "1/32",
+      "strategy": "ev",
+      "level": 14,
+      "imps": 45075,
+      "clicks": 255,
+      "cost": 1955381,
+      "ecpc": 7668.160784313725
+    },
+    {
+      "advertiser": "3427",
+      "budget": "1/32",
+      "strategy": "ev_guard",
+      "level": 14,
+      "imps": 45075,
+      "clicks": 255,
+      "cost": 1955381,
+      "ecpc": 7668.160784313725
     },
     {
       "advertiser": "3427",
@@ -322,12 +755,32 @@
     {
       "advertiser": "3427",
       "budget": "1/8",
-      "strategy": "ev",
+      "strategy": "ev_v1",
       "level": 68,
       "imps": 231866,
       "clicks": 151,
       "cost": 7821570,
       "ecpc": 51798.47682119205
+    },
+    {
+      "advertiser": "3427",
+      "budget": "1/8",
+      "strategy": "ev",
+      "level": 56,
+      "imps": 167783,
+      "clicks": 424,
+      "cost": 7821552,
+      "ecpc": 18447.056603773584
+    },
+    {
+      "advertiser": "3427",
+      "budget": "1/8",
+      "strategy": "ev_guard",
+      "level": 56,
+      "imps": 167783,
+      "clicks": 424,
+      "cost": 7821552,
+      "ecpc": 18447.056603773584
     },
     {
       "advertiser": "3427",
@@ -342,12 +795,32 @@
     {
       "advertiser": "3427",
       "budget": "1/2",
-      "strategy": "ev",
+      "strategy": "ev_v1",
       "level": 126,
       "imps": 559156,
       "clicks": 373,
       "cost": 31286413,
       "ecpc": 83877.78284182305
+    },
+    {
+      "advertiser": "3427",
+      "budget": "1/2",
+      "strategy": "ev",
+      "level": 204,
+      "imps": 514520,
+      "clicks": 533,
+      "cost": 31286388,
+      "ecpc": 58698.66416510319
+    },
+    {
+      "advertiser": "3427",
+      "budget": "1/2",
+      "strategy": "ev_guard",
+      "level": 204,
+      "imps": 514520,
+      "clicks": 533,
+      "cost": 31286388,
+      "ecpc": 58698.66416510319
     },
     {
       "advertiser": "3476",
@@ -362,12 +835,32 @@
     {
       "advertiser": "3476",
       "budget": "1/32",
-      "strategy": "ev",
+      "strategy": "ev_v1",
       "level": 160,
       "imps": 14957,
       "clicks": 7,
       "cost": 880583,
       "ecpc": 125797.57142857143
+    },
+    {
+      "advertiser": "3476",
+      "budget": "1/32",
+      "strategy": "ev",
+      "level": 14,
+      "imps": 20898,
+      "clicks": 76,
+      "cost": 880495,
+      "ecpc": 11585.46052631579
+    },
+    {
+      "advertiser": "3476",
+      "budget": "1/32",
+      "strategy": "ev_guard",
+      "level": 14,
+      "imps": 20898,
+      "clicks": 76,
+      "cost": 880495,
+      "ecpc": 11585.46052631579
     },
     {
       "advertiser": "3476",
@@ -382,12 +875,32 @@
     {
       "advertiser": "3476",
       "budget": "1/8",
-      "strategy": "ev",
+      "strategy": "ev_v1",
       "level": 80,
       "imps": 75880,
       "clicks": 28,
       "cost": 3522340,
       "ecpc": 125797.85714285714
+    },
+    {
+      "advertiser": "3476",
+      "budget": "1/8",
+      "strategy": "ev",
+      "level": 42,
+      "imps": 70365,
+      "clicks": 145,
+      "cost": 3522311,
+      "ecpc": 24291.8
+    },
+    {
+      "advertiser": "3476",
+      "budget": "1/8",
+      "strategy": "ev_guard",
+      "level": 42,
+      "imps": 70365,
+      "clicks": 145,
+      "cost": 3522311,
+      "ecpc": 24291.8
     },
     {
       "advertiser": "3476",
@@ -402,12 +915,32 @@
     {
       "advertiser": "3476",
       "budget": "1/2",
-      "strategy": "ev",
+      "strategy": "ev_v1",
       "level": 104,
       "imps": 258540,
       "clicks": 139,
       "cost": 14089447,
       "ecpc": 101362.92805755396
+    },
+    {
+      "advertiser": "3476",
+      "budget": "1/2",
+      "strategy": "ev",
+      "level": 192,
+      "imps": 240456,
+      "clicks": 193,
+      "cost": 14089498,
+      "ecpc": 73002.58031088083
+    },
+    {
+      "advertiser": "3476",
+      "budget": "1/2",
+      "strategy": "ev_guard",
+      "level": 192,
+      "imps": 240456,
+      "clicks": 193,
+      "cost": 14089498,
+      "ecpc": 73002.58031088083
     }
   ]
 }

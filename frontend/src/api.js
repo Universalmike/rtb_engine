@@ -28,6 +28,11 @@ export const fetchRecentAuctions = (limit = 20) =>
 export const submitBidRequest = (payload) =>
   api.post('/auction/bid', payload).then(r => r.data)
 
+// ── Real-auction replay (iPinYou logs) ───────────────────────────────────────
+export const fetchReplaySummary = () => api.get('/replay/summary').then(r => r.data)
+export const replayAuction = (clicked = false) =>
+  api.get('/replay/auction', { params: { clicked } }).then(r => r.data)
+
 // ── Entities ─────────────────────────────────────────────────────────────────
 export const fetchAdvertisers = () => api.get('/advertisers/').then(r => r.data)
 export const fetchCampaigns   = () => api.get('/campaigns/').then(r => r.data)
