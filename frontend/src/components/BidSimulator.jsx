@@ -15,6 +15,7 @@ const EXCLUSION_LABELS = {
   blocked_domain: 'Domain blocked',
   creative:       'No creative for size',
   floor:          'Could not clear floor',
+  pacing:         'Paced (ahead of schedule)',
 }
 
 // How the page's content category was arrived at. Shown because an inferred

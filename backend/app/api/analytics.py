@@ -240,6 +240,10 @@ async def ab_comparison(db: AsyncSession = Depends(get_db)):
         .join(Impression, Impression.auction_id == AuctionResult.auction_id)
         .outerjoin(clicks_per_impression,
                    clicks_per_impression.c.impression_id == Impression.id)
+        # House auctions only. Exchange impressions get real clicks, the
+        # house's are simulated, and mixing outcome sources in one arm
+        # would dilute it exactly the way unclicked visitor auctions did.
+        .where(AuctionResult.source == "house")
         .group_by(AuctionResult.strategy)
     )
     arms = build_ab_comparison(result.all())

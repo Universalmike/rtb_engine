@@ -9,10 +9,11 @@ Hierarchy:
 """
 
 import uuid
+from typing import Optional
 from datetime import date, datetime, timezone
 from sqlalchemy import (
     String, Boolean, DateTime, ForeignKey,
-    Integer, BigInteger, Date, Text, Enum as SAEnum, Index
+    Integer, BigInteger, Date, Float, Text, Enum as SAEnum, Index
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 import enum
@@ -87,6 +88,15 @@ class Campaign(Base):
     spend_date: Mapped[date] = mapped_column(
         Date, default=lambda: datetime.utcnow().date(), nullable=False
     )
+    # Held for exchange bids still awaiting their win or loss notice: the most
+    # each could cost. It counts against both budgets everywhere, so bids in
+    # flight cannot add up to more than the campaign has left.
+    reserved_micros: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default="0", nullable=False)
+    # asap spends as opportunities come; even holds spend to the share of the
+    # day that has passed (see app/services/pacing.py).
+    pacing: Mapped[str] = mapped_column(
+        String(10), default="asap", server_default="asap", nullable=False)
 
     # Bidding
     max_cpm_cents: Mapped[int] = mapped_column(Integer, nullable=False)  # Max bid per 1000 impressions
@@ -144,24 +154,30 @@ class Campaign(Base):
         return micros_to_cents(self.total_spent_micros)
 
     @property
-    def remaining_daily_budget_micros(self) -> int:
-        """Today's remaining daily budget.
+    def effective_spent_today_micros(self) -> int:
+        """Today's spend, reading a stale spend_date as nothing spent yet.
 
         Spend carried from an earlier day has effectively rolled over already;
         the row is only rewritten when the campaign is next charged, so a
         stale spend_date must read as zero spent rather than yesterday's
         total. See AuctionEngine._spent_today_expression for the SQL twin.
         """
-        spent = (
+        return (
             self.spent_today_micros
             if self.spend_date == datetime.now(timezone.utc).date()
             else 0
         )
-        return max(0, self.daily_budget_micros - spent)
+
+    @property
+    def remaining_daily_budget_micros(self) -> int:
+        """Today's budget left after spend and in-flight reservations."""
+        return max(0, self.daily_budget_micros - self.effective_spent_today_micros
+                   - (self.reserved_micros or 0))
 
     @property
     def remaining_total_budget_micros(self) -> int:
-        return max(0, self.total_budget_micros - self.total_spent_micros)
+        return max(0, self.total_budget_micros - self.total_spent_micros
+                   - (self.reserved_micros or 0))
 
     @property
     def remaining_daily_budget_cents(self) -> float:
@@ -286,7 +302,13 @@ class AuctionResult(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=gen_uuid)
     auction_id: Mapped[str] = mapped_column(String(36), unique=True, nullable=False)
-    ad_slot_id: Mapped[str] = mapped_column(ForeignKey("ad_slots.id"), nullable=False)
+    # Null for an impression bought on an exchange: the slot is the publisher's.
+    ad_slot_id: Mapped[Optional[str]] = mapped_column(ForeignKey("ad_slots.id"), nullable=True)
+    # house: the engine's own auction over its slots; openrtb: an impression
+    # won on an exchange. Their clicks differ in kind (simulated vs real), so
+    # the house A/B reads only its own.
+    source: Mapped[str] = mapped_column(
+        String(10), default="house", server_default="house", nullable=False)
     winning_campaign_id: Mapped[str] = mapped_column(ForeignKey("campaigns.id"), nullable=True)
     winning_creative_id: Mapped[str] = mapped_column(ForeignKey("ad_creatives.id"), nullable=True)
     highest_bid_cents: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -312,7 +334,9 @@ class Impression(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=gen_uuid)
     auction_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     campaign_id: Mapped[str] = mapped_column(ForeignKey("campaigns.id"), nullable=False)
-    ad_slot_id: Mapped[str] = mapped_column(ForeignKey("ad_slots.id"), nullable=False)
+    ad_slot_id: Mapped[Optional[str]] = mapped_column(ForeignKey("ad_slots.id"), nullable=True)
+    source: Mapped[str] = mapped_column(
+        String(10), default="house", server_default="house", nullable=False)
     clearing_price_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     charged_cost_micros: Mapped[int] = mapped_column(BigInteger, nullable=False)
     country: Mapped[str] = mapped_column(String(2), nullable=True)
@@ -335,3 +359,45 @@ class Click(Base):
     impression_id: Mapped[str] = mapped_column(ForeignKey("impressions.id"), nullable=False)
     campaign_id: Mapped[str] = mapped_column(ForeignKey("campaigns.id"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+# ─── Exchange bids (OpenRTB) ──────────────────────────────────────────────────
+
+class ExchangeBid(Base):
+    """
+    Every bid sent to an exchange, and what became of it.
+
+    The row is the reservation's ledger entry and the bid's notice target, and
+    it doubles as the feature log: the model's inputs, its prediction and the
+    outcome, which is the training data the next model learns from.
+    """
+    __tablename__ = "exchange_bids"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=gen_uuid)
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    imp_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    campaign_id: Mapped[str] = mapped_column(ForeignKey("campaigns.id"), nullable=False)
+    creative_id: Mapped[str] = mapped_column(ForeignKey("ad_creatives.id"), nullable=False)
+    strategy: Mapped[str] = mapped_column(String(20), nullable=False)
+    model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    pctr: Mapped[float] = mapped_column(Float, nullable=False)
+    features: Mapped[str] = mapped_column(Text, nullable=False)   # JSON
+    bid_cents: Mapped[int] = mapped_column(Integer, nullable=False)  # CPM
+    # pending -> won | lost | expired. Only a pending bid holds a reservation.
+    status: Mapped[str] = mapped_column(String(10), default="pending", nullable=False)
+    reserved_micros: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # What the last settlement took off the campaign's reservation. Written in
+    # the same UPDATE that zeroes reserved_micros, so two notices racing for
+    # one bid can never both release it.
+    released_micros: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    charged_micros: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    impression_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    loss_reason: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    clicked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    settled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        # The sweeper looks for pending bids older than their TTL.
+        Index("ix_exchange_bids_status_created", "status", "created_at"),
+    )

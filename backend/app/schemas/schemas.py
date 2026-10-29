@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field, model_validator
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 from app.models.models import CampaignStatus, AuctionType, DeviceType
 
 
@@ -36,6 +36,9 @@ class CampaignCreate(BaseModel):
     # domain; blocked_domains vetoes regardless of everything else.
     target_domains: list[str] = []
     blocked_domains: list[str] = []
+    # asap spends as opportunities come; even holds spend to the share of
+    # the day that has passed.
+    pacing: Literal["asap", "even"] = "asap"
     start_date: datetime
     end_date: Optional[datetime] = None
 
@@ -60,6 +63,9 @@ class CampaignOut(BaseModel):
     value_per_click_millicents: int
     auction_type: AuctionType
     remaining_daily_budget_cents: float
+    # Held by exchange bids awaiting their notices; counted against budget.
+    reserved_micros: int = 0
+    pacing: str = "asap"
     can_bid: bool
     start_date: datetime
     end_date: Optional[datetime]

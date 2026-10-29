@@ -28,7 +28,8 @@ Publisher (SSP)  →  Bid Request  →  RTB Engine  →  Auction Result
 ## Key Features
 
 - **Second-price (Vickrey) auction** — winners pay 2nd highest bid + $0.01, incentivising truthful bidding
-- **Budget pacing** — campaigns auto-pause when daily budget is exhausted
+- **OpenRTB 2.5 bidder** — exchanges send standard bid requests; bids reserve budget, and win, loss and click notices settle them exactly once
+- **Budget capping and pacing** — campaigns stop at their daily and lifetime budgets, and `even`-paced campaigns spread spend across the day
 - **Targeting** — country, device type, and IAB category filtering
 - **Redis Streams event pipeline** — impression events fire asynchronously, never blocking the auction response
 - **CTR-driven expected-value bidding** — a click-through-rate model trained on real ad data lets campaigns bid `pCTR × value_per_click` instead of a flat CPM (see below)
@@ -52,6 +53,76 @@ Auction prices and campaign spend intentionally use different units:
 The auction response exposes both `clearing_price_cents` (the CPM quote) and
 `charged_cost_micros` (the exact cost of that impression), making the unit
 boundary visible in the demo and auditable in tests.
+
+## Bidding on an Exchange (OpenRTB 2.5)
+
+In the house auction the engine is the exchange: it runs the auction and sets
+the price. On a real exchange the roles change. The exchange runs the auction;
+the bidder only says what it would pay, then learns the outcome from a **win**
+or **loss notice**, often seconds later and sometimes never.
+`POST /api/v1/openrtb/2.5/bid` takes a standard OpenRTB 2.5 bid request and
+answers with a bid response (`price`, `adm`, `nurl`, `lurl`, `crid`, `adomain`),
+or `204 No Content` when it doesn't bid, as the spec has it.
+
+- **Same decision code.** The exchange's impression (`imp.banner`,
+  `imp.bidfloor`, `site`, `device`) is shaped like a house slot. The engine's
+  own eligibility SQL, targeting, pacing, A/B arm and pCTR model decide the
+  bid. Country arrives as ISO alpha-3 and category as IAB codes, and both are
+  mapped.
+- **Bids reserve budget.** The bidder doesn't know the price when it bids, so
+  it holds the most the bid could cost (the bid itself) on the campaign, in
+  the same statement that logs the bid. Reservations count against budgets
+  everywhere, the house auction included. However many bids are in flight,
+  they can't together overspend. A test fires 30 concurrent bid requests at a
+  campaign with room for two: exactly two are bid, and both win at full price
+  without crossing the budget.
+- **Settled exactly once.** A win charges the exchange's clearing price,
+  capped at the bid, and releases the reservation. A loss releases it. A bid
+  that hears nothing expires after `BID_TTL_SECONDS` (60), and a background
+  sweeper releases it, because most exchanges never send loss notices. Each
+  settlement takes the bid's row lock, so 8 duplicate win notices fired at
+  once charge once (tested). A win that arrives after its bid expired is still
+  billed, since the ad ran. It's the one path that can overspend, and it's
+  logged as `late`.
+- **Clicks.** The ad markup routes clicks through `/openrtb/click/{bid}`. It
+  counts a click once per impression, even one that arrives before its win
+  notice, and redirects to the creative's own landing page. Nothing in the URL
+  chooses the destination, so it isn't an open redirect.
+- **Pacing.** An `even` campaign may only have spent (including reservations)
+  the share of the UTC day that has passed, plus 5% headroom. It applies in
+  both the house auction and the bidder, and the simulator names it as an
+  exclusion reason.
+- **Declines.** The bidder declines non-USD currencies, IAB25/IAB26 content,
+  connected TV, video-only impressions, and advertisers on the request's
+  `badv` block list.
+- **The feature log.** Every exchange bid stores the model's inputs, its pCTR,
+  the model version, the A/B arm, the bid and its outcome, plus the request's
+  user segments, which the served model doesn't read. The iPinYou replay found
+  segments carry most of the click signal, so the next model can use them.
+  `GET /api/v1/openrtb/log.csv` exports settled bids as that training set.
+- **Kept separate.** Exchange impressions are stored with `source = openrtb`,
+  and the house A/B panel ignores them: their clicks are real, the house's are
+  simulated, and mixing the two dilutes an arm.
+
+[`scripts/simulate_exchange.py`](scripts/simulate_exchange.py) plays the
+exchange. It sends bid requests, runs a second-price auction against simulated
+competitors, calls `nurl` on a win and `lurl` on only half the losses, and
+clicks some winning ads. In a 600-request run, the bidder's books matched the
+exchange's exactly: 372 wins, $0.1327 spent, and 4 clicks. Of the 225 losses,
+107 were released by loss notices and the rest by the sweeper, and the
+reservations returned to zero.
+
+**Measured limit: one hot row.** A bid takes 25ms p50 locally on its own. Ten
+at a time, the p50 rises to about 150ms, and adding worker processes barely
+moves throughput (~65 to 75 bids/s). Postgres shows why: sampled during the
+load, 29 of 44 active backends were waiting on row locks, and most of the rest
+on WAL sync. One run-of-network campaign was the top bidder on 1,196 requests,
+so nearly every reservation updates that one campaign row and they queue
+behind each other's commits. The house auction has the same limit. The usual
+fix is **budget leasing**: each process reserves a small slice of a campaign's
+budget occasionally and spends from it in memory. That keeps the
+no-overspend guarantee with far fewer writes to the hot row, and it's the next
+piece to build.
 
 ## Machine Learning: CTR-Driven Bidding
 
@@ -366,6 +437,12 @@ a page on the site that owns the inventory.
 | `GET` | `/api/v1/analytics/ab-comparison` | Flat-CPM vs expected-value bidding, per arm, with a 95% CI on the CPC change |
 | `GET` | `/api/v1/replay/auction` | Replay a real iPinYou request through the served model (`?clicked=true` for a clicked one) |
 | `GET` | `/api/v1/replay/summary` | The served model's version, metrics and offline evaluation |
+| `POST` | `/api/v1/openrtb/2.5/bid` | OpenRTB 2.5 bid request; a bid response, or 204 for no bid |
+| `GET` | `/api/v1/openrtb/win/{bid_id}?price=` | Win notice (`nurl`): charge the clearing price once |
+| `GET` | `/api/v1/openrtb/loss/{bid_id}?reason=` | Loss notice (`lurl`): release the reservation |
+| `GET` | `/api/v1/openrtb/click/{bid_id}` | Count a click once and redirect to the creative's landing page |
+| `GET` | `/api/v1/openrtb/stats` | Bids by outcome, reserved budget, win rate, eCPC |
+| `GET` | `/api/v1/openrtb/log.csv` | Settled exchange bids with model inputs and outcomes: the next training set |
 | `POST` | `/api/v1/advertisers/` | Create advertiser |
 | `POST` | `/api/v1/campaigns/` | Create campaign |
 | `POST` | `/api/v1/publishers/slots` | Create ad slot |

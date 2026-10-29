@@ -30,7 +30,7 @@ from sqlalchemy import (
     insert, literal, or_, select, true, update,
 )
 from sqlalchemy.dialects.postgresql import ARRAY
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import contains_eager, joinedload
 from sqlalchemy.orm.attributes import set_committed_value
 
 from app.models.models import (
@@ -43,6 +43,7 @@ from app.ml.artifacts import load_empirical_ctr
 from app.ml.predictor import predict_ctr
 from app.ml.simulation import lookup_ctr
 from app.services.contextual import classify_url, domain_of
+from app.services.pacing import ahead_of_pace
 logger = logging.getLogger(__name__)
 
 # Phase timings are always logged; set AUCTION_PROFILE=1 to also return them on
@@ -306,11 +307,17 @@ class AuctionEngine:
         if page_category is None:
             page_category, _ = self._context_category(bid_request, ad_slot)
 
+        # The least this impression could cost: what a paced campaign must be
+        # able to spend now without running ahead of its schedule.
+        minimum_charge = cpm_cents_to_impression_micros(ad_slot.floor_price_cents)
+        now = datetime.now(timezone.utc)
         eligible: list[Campaign] = []
         excluded: dict[str, int] = {}
         for c in campaigns:
             reason = self._targeting_rejection(
                 c, bid_request, ad_slot, page_category)
+            if reason is None and ahead_of_pace(c, minimum_charge, now):
+                reason = "pacing"
             if reason is None:
                 eligible.append(c)
             else:
@@ -345,10 +352,11 @@ class AuctionEngine:
                     Advertiser.is_active == True,
                     Campaign.start_date <= now,
                     or_(Campaign.end_date.is_(None), Campaign.end_date > now),
-                    spent_today + minimum_charge
+                    spent_today + Campaign.reserved_micros + minimum_charge
                     <= cast(Campaign.daily_budget_cents, BigInteger)
                     * MICROS_PER_CENT,
-                    Campaign.total_spent_micros + minimum_charge
+                    Campaign.total_spent_micros + Campaign.reserved_micros
+                    + minimum_charge
                     <= cast(Campaign.total_budget_cents, BigInteger)
                     * MICROS_PER_CENT,
                     Campaign.max_cpm_cents >= ad_slot.floor_price_cents,
@@ -370,6 +378,10 @@ class AuctionEngine:
             # size was asked about first, and the spend as of then. The
             # seeder runs every auction through one session, and without
             # this its fill rate fell from ~96% to ~18%.
+            # The advertiser is already joined for is_active; taking its
+            # columns too costs no round trip, and an exchange bid needs its
+            # domain for the bid response and the exchange's block list.
+            .options(contains_eager(Campaign.advertiser))
             .execution_options(populate_existing=True)
         )
         # joinedload on a collection repeats the parent row per child, so the
@@ -579,7 +591,9 @@ class AuctionEngine:
         """INSERTs recording a filled auction, to ride along with its charge.
 
         Each is a builder taking the reservation CTE and returning an INSERT
-        CTE that selects from it. A reservation that matches no row yields no
+        CTE that selects from it. Every column with a default is written
+        explicitly: an omitted one becomes a bind parameter named after it,
+        and two tables sharing a column name (source) would then collide. A reservation that matches no row yields no
         rows to insert, so the auction is recorded exactly when it is paid
         for. Every value is typed explicitly: an untyped parameter in an
         INSERT ... SELECT has no target column to infer its type from.
@@ -603,6 +617,7 @@ class AuctionEngine:
                 AuctionResult.charged_cost_micros: charged_cost_micros,
                 AuctionResult.num_bidders: len(bids),
                 AuctionResult.strategy: strategy,
+                AuctionResult.source: "house",
                 AuctionResult.had_fill: True,
                 AuctionResult.created_at: now,
             }
@@ -617,6 +632,7 @@ class AuctionEngine:
                 Impression.auction_id: auction_id,
                 Impression.campaign_id: winner.id,
                 Impression.ad_slot_id: ad_slot.id,
+                Impression.source: "house",
                 Impression.clearing_price_cents: result["clearing_price_cents"],
                 Impression.charged_cost_micros: charged_cost_micros,
                 Impression.country: bid_request.country,
@@ -716,8 +732,13 @@ class AuctionEngine:
                         Campaign.spend_date < today,
                     ),
                 ),
-                new_daily_spend <= daily_limit,
-                new_total_spend <= total_limit,
+                # Bids in flight on an exchange hold budget too: an auction
+                # here may only spend what they have not already claimed.
+                # (Written as limit minus reservation: the spend expressions
+                # also feed SET, and wrapping them makes SQLAlchemy refuse to
+                # compile one bind parameter in both clauses.)
+                new_daily_spend <= daily_limit - Campaign.reserved_micros,
+                new_total_spend <= total_limit - Campaign.reserved_micros,
             )
             .values(
                 spent_today_micros=new_daily_spend,

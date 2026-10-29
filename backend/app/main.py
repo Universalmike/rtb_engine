@@ -1,15 +1,39 @@
+import asyncio
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from app.core.database import (
-    DISABLE_STATEMENT_CACHE, engine, ensure_schema, warm_connection_pool,
+    AsyncSessionLocal, DISABLE_STATEMENT_CACHE, engine, ensure_schema,
+    warm_connection_pool,
 )
 from app.core.config import get_settings
 from app.ml import ipinyou
 
 settings = get_settings()
+
+SWEEP_INTERVAL_SECONDS = float(os.getenv("SWEEP_INTERVAL_SECONDS", "15"))
+
+
+async def sweep_expired_bids():
+    """Release reservations of exchange bids that never got a notice.
+
+    Most exchanges never send loss notices, so without this every lost bid
+    would hold its campaign's budget forever.
+    """
+    from app.services.openrtb import Bidder
+    while True:
+        await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+        try:
+            async with AsyncSessionLocal() as session:
+                released = await Bidder(session).expire_stale()
+                await session.commit()
+            if released:
+                print(f"[sweeper] released {released} expired exchange bids")
+        except Exception as e:
+            print(f"[sweeper] failed, will retry: {e}")
 
 
 @asynccontextmanager
@@ -50,7 +74,10 @@ async def lifespan(app: FastAPI):
     print(f"[startup] iPinYou replay: "
           + (f"model {model['version']}, {len(sample)} requests" if model and sample
              else "artifacts missing, /api/v1/replay disabled"))
+
+    sweeper = asyncio.create_task(sweep_expired_bids())
     yield
+    sweeper.cancel()
     # Shutdown: dispose connection pool
     await engine.dispose()
     print("[shutdown] Database connections closed")
@@ -75,7 +102,9 @@ app.add_middleware(
 )
 
 # ─── Routers (added as we build each day) ────────────────────────────────────
-from app.api import advertisers, campaigns, publishers, auction, analytics, seed, replay
+from app.api import (
+    advertisers, campaigns, publishers, auction, analytics, seed, replay, openrtb,
+)
 
 app.include_router(advertisers.router, prefix="/api/v1/advertisers", tags=["Advertisers"])
 app.include_router(campaigns.router, prefix="/api/v1/campaigns", tags=["Campaigns"])
@@ -84,6 +113,7 @@ app.include_router(auction.router, prefix="/api/v1/auction", tags=["Auction"])
 app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["Analytics"])
 app.include_router(seed.router, prefix="/api/v1/seed", tags=["Seed"])
 app.include_router(replay.router, prefix="/api/v1/replay", tags=["Replay"])
+app.include_router(openrtb.router, prefix="/api/v1/openrtb", tags=["OpenRTB"])
 
 
 @app.get("/")
