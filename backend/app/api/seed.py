@@ -75,7 +75,10 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
     for name in advertiser_names:
         adv = Advertiser(
             name=name,
-            domain=fake.domain_name(),
+            # .example is reserved (RFC 2606) and never resolves. A generated
+            # .com can be someone's real site, and a demo ad's click would
+            # send the visitor there.
+            domain=f"{name.lower().replace(' ', '')}.example",
         )
         db.add(adv)
         advertisers.append(adv)
@@ -198,6 +201,7 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
 
     # ── Creatives ────────────────────────────────────────────────────────────
     creative_sizes = {(w, h) for _, w, h, _, _ in slot_configs}
+    advertiser_domain = {adv.id: adv.domain for adv in advertisers}
     for campaign in campaigns:
         for width, height in creative_sizes:
             creative = AdCreative(
@@ -206,7 +210,9 @@ async def seed_database(db: AsyncSession = Depends(get_db)):
                 creative_type="banner",
                 width=width,
                 height=height,
-                click_url=f"https://{fake.domain_name()}/landing",
+                # The ad lands on its own advertiser's site, the domain an
+                # exchange is told in adomain and checks against badv.
+                click_url=f"https://{advertiser_domain[campaign.advertiser_id]}/landing",
                 asset_url=(
                     f"https://picsum.photos/{width}/{height}"
                     f"?random={random.randint(1,999)}"
